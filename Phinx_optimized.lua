@@ -72653,14 +72653,42 @@ local Maid = require("Utility/Maid")
 local optimizeGameMaid = Maid.new()
 local initialized = false
 local ranVisuals = false
+local function hasNameToken(name, token)
+return string.find(string.lower(name or ""), token, 1, true) ~= nil
+end
+local function isProtectedObject(obj)
+-- Never optimize player/character content. This keeps characters, animations,
+-- accessories, and their visual assets intact.
+local players = game:GetService("Players")
+if obj:IsDescendantOf(players) then
+return true
+end
+local current = obj
+while current do
+if current:IsA("Tool") then
+return true
+end
+if current:IsA("Model") and current:FindFirstChildOfClass("Humanoid") then
+return true
+end
+local name = current.Name
+if hasNameToken(name, "mantra") or hasNameToken(name, "weapon") or hasNameToken(name, "enchant") then
+return true
+end
+current = current.Parent
+end
+return false
+end
 local function downgradeObject(obj)
+if isProtectedObject(obj) then
+return
+end
 if obj:IsA("BasePart") then
 obj.Material = Enum.Material.Plastic
 obj.Reflectance = 0
 obj.CastShadow = false
 end
--- Remove expensive cosmetic textures while keeping the instances alive so
--- scripts that reference them are less likely to break.
+-- Remove expensive world/cosmetic textures while keeping the instances alive.
 if obj:IsA("Texture") or obj:IsA("Decal") then
 obj.Texture = ""
 elseif obj:IsA("SurfaceAppearance") then
