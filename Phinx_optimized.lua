@@ -2883,7 +2883,9 @@ table.insert(
 Library.Signals,
 RenderStepped:Connect(function(Delta)
 if Toggles.ShowLoggerWindow and not Toggles.ShowLoggerWindow.Value then
+if next(Entries) ~= nil then
 Entries = {}
+end
 end
 local NextIndex, NextEntry = next(Entries)
 if NextIndex and NextEntry then
@@ -17727,7 +17729,9 @@ if
 not Configuration.expectToggleValue("EnableAutoDefense")
 or not Configuration.expectToggleValue("BlockInput")
 then
+if next(blockInputActive) ~= nil then
 blockInputActive = {}
+end
 return
 end
 local allowedTargets = Configuration.expectOptionValue("BlockInputAllowedTargets") or {
@@ -72426,6 +72430,7 @@ return nil
 end
 local function updateRevealAnimations()
 if not Configuration.expectToggleValue("RevealAnimations") then
+if next(modifiedAnimations) ~= nil then
 for animationTrack in pairs(modifiedAnimations) do
 if animationTrack.Parent then
 pcall(function()
@@ -72434,6 +72439,7 @@ end)
 end
 end
 modifiedAnimations = {}
+end
 return
 end
 local currentTime = os.clock()
@@ -74304,7 +74310,12 @@ local Logger = require("Utility/Logger")
 local EchoFarm = require("Features/Automation/EchoFarm")
 local renderStepped = Signal.new(runService.RenderStepped)
 local ownershipMaid = Maid.new()
+local partsDirty = true
 local function cleanParts()
+if not partsDirty then
+return
+end
+partsDirty = false
 for _, maid in next, OwnershipWatcher.modelsToScan do
 maid:clean()
 end
@@ -74333,6 +74344,7 @@ and not EchoFarm.voiding
 then
 return cleanParts()
 end
+partsDirty = true
 local updateTable = {}
 for model, maid in next, OwnershipWatcher.modelsToScan do
 local humanoidRootPart = model:FindFirstChild("HumanoidRootPart")
