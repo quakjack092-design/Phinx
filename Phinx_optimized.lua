@@ -65077,7 +65077,11 @@ internalCount,
 os.clock() - timestamp
 )
 local success, result = pcall(fs.read, fs, "autoload.txt")
-if success and result then
+if success and typeof(result) == "string" then
+local autoloadName = result:gsub("^%s+", ""):gsub("%s+$", "")
+if #autoloadName > 0 then
+SaveManager.load(autoloadName)
+end
 end
 SaveManager.as = TimingContainerPair.new(internalAnimationContainer, config:get().animation)
 SaveManager.es = TimingContainerPair.new(internalEffectContainer, config:get().effect)
@@ -72331,6 +72335,7 @@ local Logger = require("Utility/Logger")
 local Defense = require("Features/Combat/Defense")
 local ExpApBreaker = require("Features/Combat/ExpApBreaker")
 local AnimationVisualizer = require("Features/Game/AnimationVisualizer")
+local AnimationLogger = require("Features/Game/AnimationLogger")
 local FishFarm = require("Features/Automation/FishFarm")
 local Teleport = require("Features/Game/Teleport")
 local AutoLoot = require("Features/Automation/AutoLoot")
@@ -72365,6 +72370,7 @@ Logger.warn("Features initialized.")
 end
 end
 function Features.detach()
+AnimationLogger.detach()
 if not armorshield or armorshield.current_role == "builder" then
 AnimationVisualizer.detach()
 end
@@ -81373,6 +81379,1460 @@ __bundle_register("GUI/Icons", function(require, _LOADED, __bundle_register, __b
 return {
 Combat = { Id = 16898787671, Offset = Vector2.new(514, 514), Size = Vector2.new(256, 256) }, 	Visuals = { Id = 16898669897, Offset = Vector2.new(0, 0), Size = Vector2.new(256, 256) }, 	Game = { Id = 16898672166, Offset = Vector2.new(257, 0), Size = Vector2.new(256, 256) }, 	Auto = { Id = 16898617146, Offset = Vector2.new(0, 0), Size = Vector2.new(256, 256) }, 	Exploit = { Id = 16898734564, Offset = Vector2.new(0, 0), Size = Vector2.new(256, 256) }, 	Settings = { Id = 16898734421, Offset = Vector2.new(514, 0), Size = Vector2.new(256, 256) }, 	Builder = { Id = 16898791187, Offset = Vector2.new(514, 257), Size = Vector2.new(256, 256) }, }
 end)
+__bundle_register("Features/Game/AnimationLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
+local AnimationLogger = {}
+
+local Library = require("GUI/Library")
+local CoreGuiManager = require("Utility/CoreGuiManager")
+local SaveManager = require("Game/Timings/SaveManager")
+local AnimationTiming = require("Game/Timings/AnimationTiming")
+local Action = require("Game/Timings/Action")
+local Logger = require("Utility/Logger")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+---------------------------------------------------------------------------
+-- Constants / settings
+---------------------------------------------------------------------------
+local MAX_ENTRIES = 250
+local DEFAULT_SAVE_NAME = "AnimationLogger"
+local DT = 0.01
+local MAX_CURVE_STEPS = 3000
+local FONT = Font.new("rbxasset://fonts/families/RobotoMono.json")
+
+local TAGS = { "Undefined", "M1", "Mantra", "Critical" }
+
+local ACTION_COLORS = {
+	["Parry"] = Color3.fromRGB(95, 208, 104),
+	["Dodge"] = Color3.fromRGB(80, 160, 255),
+	["Forced Full Dodge"] = Color3.fromRGB(175, 110, 255),
+	["Start Block"] = Color3.fromRGB(255, 170, 60),
+	["End Block"] = Color3.fromRGB(255, 95, 80),
+	["Jump"] = Color3.fromRGB(240, 225, 90),
+}
+
+local settings = {
+	range = 100,
+	includeSelf = false,
+	hideKnown = false,
+	search = "",
+}
+
+---------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------
+local enabled = false
+local entries = {}
+local byAid = {}
+local selected = nil
+local rowsDirty = false
+local lastRowRefresh = 0
+
+local hooked = setmetatable({}, { __mode = "k" })
+local watchers = {}
+local liveConnections = {}
+local globalConnections = {}
+
+local ui = nil
+local preview = nil
+local loadToken = 0
+local dragging = false
+local holdStartMs = nil
+local flipView = false
+
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+local function canonicalAid(raw)
+	local text = tostring(raw or "")
+	local plain = text:match("^rbxassetid://(%d+)$")
+	if plain then
+		return "rbxassetid://" .. plain
+	end
+	local id = text:match("[?&]id=(%d+)")
+	if id and (text:find("^rbxassetid://") or text:find("^https?://") or text:find("^rbxasset://")) then
+		return "rbxassetid://" .. id
+	end
+	return text
+end
+
+local function esc(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function notify(fmt, ...)
+	pcall(Logger.notify, fmt, ...)
+end
+
+local function userContainer()
+	return SaveManager.as and SaveManager.as.config or nil
+end
+
+-- "user" = saved in your own config, "builtin" = shipped timing, nil = none
+local function timingStatus(aid)
+	local container = userContainer()
+	if container and container.timings[aid] then
+		return "user"
+	end
+	if SaveManager.as and SaveManager.as:index(aid) then
+		return "builtin"
+	end
+	return nil
+end
+
+local function getRoot(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function resolveEntity(animator)
+	local node = animator.Parent
+	local fallback = nil
+	while node and node ~= Workspace do
+		if node:IsA("Model") then
+			fallback = fallback or node
+			if node:FindFirstChildOfClass("Humanoid") or node:FindFirstChild("HumanoidRootPart") then
+				return node
+			end
+		end
+		node = node.Parent
+	end
+	return fallback
+end
+
+local function distanceTo(model)
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	local localRoot = character and character:FindFirstChild("HumanoidRootPart")
+	local root = getRoot(model)
+	if not root then
+		return nil
+	end
+	if not localRoot then
+		return 0
+	end
+	return (root.Position - localRoot.Position).Magnitude
+end
+
+local function parseVector(text, fallback)
+	local nums = {}
+	for token in tostring(text):gmatch("%-?%d*%.?%d+") do
+		nums[#nums + 1] = tonumber(token)
+	end
+	if #nums >= 3 then
+		return Vector3.new(nums[1], nums[2], nums[3])
+	end
+	if #nums == 1 then
+		return Vector3.new(nums[1], nums[1], nums[1])
+	end
+	return fallback
+end
+
+---------------------------------------------------------------------------
+-- Speed curve (maps real elapsed time -> animation time position)
+---------------------------------------------------------------------------
+local function speedAt(samples, elapsed)
+	local speed = 1
+	if samples then
+		for i = 1, #samples do
+			local sample = samples[i]
+			if sample.t <= elapsed then
+				speed = sample.s
+			else
+				break
+			end
+		end
+	end
+	return speed
+end
+
+local function buildCurve(samples, length)
+	local tps, es = { [0] = 0 }, { [0] = 0 }
+	local tp, e, n = 0, 0, 0
+	while tp < length and n < MAX_CURVE_STEPS do
+		local speed = speedAt(samples, e)
+		tp = tp + math.max(speed, 0) * DT
+		e = e + DT
+		n = n + 1
+		tps[n] = math.min(tp, length)
+		es[n] = e
+	end
+	if n == 0 then
+		n = 1
+		tps[1] = length
+		es[1] = DT
+		e = DT
+	end
+	return { tp = tps, e = es, n = n, total = e }
+end
+
+local function tpFromElapsed(curve, elapsed)
+	if elapsed <= 0 then
+		return 0
+	end
+	if elapsed >= curve.total then
+		return curve.tp[curve.n]
+	end
+	local f = elapsed / DT
+	local i = math.floor(f)
+	local frac = f - i
+	local a = curve.tp[i]
+	local b = curve.tp[i + 1] or a
+	return a + (b - a) * frac
+end
+
+---------------------------------------------------------------------------
+-- Logging (live capture of AnimationPlayed)
+---------------------------------------------------------------------------
+local function onAnimationPlayed(animator, track)
+	if not enabled or not track then
+		return
+	end
+	local animation = track.Animation
+	if not animation then
+		return
+	end
+	local raw = tostring(animation.AnimationId)
+	if raw == "" then
+		return
+	end
+
+	local model = resolveEntity(animator)
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	if model and character and model == character and not settings.includeSelf then
+		return
+	end
+
+	local distance = model and distanceTo(model) or nil
+	if not distance or distance > settings.range then
+		return
+	end
+
+	local aid = canonicalAid(raw)
+	local entry = byAid[aid]
+	if not entry then
+		entry = {
+			aid = aid,
+			raw = raw,
+			count = 0,
+			length = 0,
+			samples = nil,
+			draft = nil,
+			lastSeen = os.clock(),
+			entityName = "Unknown",
+			distance = 0,
+		}
+		byAid[aid] = entry
+		entries[#entries + 1] = entry
+		if #entries > MAX_ENTRIES then
+			local oldestIdx, oldestTime = nil, math.huge
+			for idx, candidate in ipairs(entries) do
+				if candidate ~= selected and candidate.lastSeen < oldestTime then
+					oldestIdx, oldestTime = idx, candidate.lastSeen
+				end
+			end
+			if oldestIdx then
+				local removed = table.remove(entries, oldestIdx)
+				byAid[removed.aid] = nil
+				if removed.row then
+					removed.row:Destroy()
+				end
+			end
+		end
+	end
+
+	entry.count = entry.count + 1
+	entry.lastSeen = os.clock()
+	entry.entity = model
+	entry.entityName = model and model.Name or "Unknown"
+	entry.distance = distance
+	entry.raw = raw
+	local length = tonumber(track.Length) or 0
+	if length > 0 then
+		entry.length = length
+	end
+
+	entry.samples = { { t = 0, s = tonumber(track.Speed) or 1 } }
+	watchers[track] = { entry = entry, base = os.clock(), last = tonumber(track.Speed) or 1 }
+
+	rowsDirty = true
+end
+
+local function hookAnimator(animator)
+	if hooked[animator] then
+		return
+	end
+	local connection = animator.AnimationPlayed:Connect(function(track)
+		onAnimationPlayed(animator, track)
+	end)
+	hooked[animator] = connection
+	animator.Destroying:Connect(function()
+		local existing = hooked[animator]
+		if existing then
+			existing:Disconnect()
+			hooked[animator] = nil
+		end
+	end)
+end
+
+local function stepWatchers()
+	local now = os.clock()
+	for track, watcher in next, watchers do
+		if now - watcher.base > 30 or not track.IsPlaying then
+			watchers[track] = nil
+		else
+			local speed = tonumber(track.Speed) or 1
+			if speed ~= watcher.last then
+				watcher.last = speed
+				watcher.entry.samples[#watcher.entry.samples + 1] = { t = now - watcher.base, s = speed }
+			end
+		end
+	end
+end
+
+local function disconnectList(list)
+	for _, connection in ipairs(list) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(list)
+end
+
+function AnimationLogger.setEnabled(state)
+	state = state and true or false
+	if state == enabled then
+		return
+	end
+	enabled = state
+
+	if ui and ui.logToggle then
+		ui.logToggle.Text = enabled and "Logging: ON" or "Logging: OFF"
+	end
+
+	if not enabled then
+		disconnectList(liveConnections)
+		for animator, connection in next, hooked do
+			pcall(function()
+				connection:Disconnect()
+			end)
+			hooked[animator] = nil
+		end
+		table.clear(watchers)
+		return
+	end
+
+	for _, descendant in ipairs(Workspace:GetDescendants()) do
+		if descendant:IsA("Animator") then
+			hookAnimator(descendant)
+		end
+	end
+	liveConnections[#liveConnections + 1] = Workspace.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("Animator") then
+			hookAnimator(descendant)
+		end
+	end)
+	liveConnections[#liveConnections + 1] = RunService.Heartbeat:Connect(stepWatchers)
+end
+
+function AnimationLogger.setRange(value)
+	settings.range = tonumber(value) or settings.range
+end
+
+function AnimationLogger.setIncludeSelf(value)
+	settings.includeSelf = value and true or false
+end
+
+---------------------------------------------------------------------------
+-- Persistence (writes into the timing config so it survives re-execution)
+---------------------------------------------------------------------------
+local function ensureConfig()
+	if SaveManager.llcn then
+		return SaveManager.llcn
+	end
+
+	local exists = false
+	local okList, list = pcall(SaveManager.list)
+	if okList and typeof(list) == "table" then
+		exists = table.find(list, DEFAULT_SAVE_NAME) ~= nil
+	end
+
+	if exists then
+		-- Never overwrite an existing file we failed to read.
+		pcall(SaveManager.load, DEFAULT_SAVE_NAME)
+		return SaveManager.llcn
+	end
+
+	SaveManager.llcn = DEFAULT_SAVE_NAME
+	pcall(SaveManager.autoload, DEFAULT_SAVE_NAME)
+	return DEFAULT_SAVE_NAME
+end
+
+local function persist()
+	local name = SaveManager.llcn or DEFAULT_SAVE_NAME
+	local ok, code = pcall(SaveManager.write, name)
+	return ok and code == 0
+end
+
+---------------------------------------------------------------------------
+-- Draft (the timing being built for the selected animation)
+---------------------------------------------------------------------------
+local function defaultName(entry)
+	local short = entry.aid:match("(%d+)$") or entry.aid
+	return string.format("%s - %s", entry.entityName or "Anim", short)
+end
+
+local function sortActions(draft)
+	table.sort(draft.actions, function(a, b)
+		return a.when < b.when
+	end)
+end
+
+local function draftFromTiming(timing, entry)
+	local draft = {
+		name = timing.name or defaultName(entry),
+		tag = timing.tag or "Undefined",
+		maxDist = tonumber(timing.imxd) or 60,
+		hitbox = timing.hitbox or Vector3.new(20, 20, 25),
+		actions = {},
+	}
+	local ok, stack = pcall(function()
+		return timing.actions:stack()
+	end)
+	if ok and stack then
+		for _, action in ipairs(stack) do
+			draft.actions[#draft.actions + 1] = {
+				type = action._type,
+				when = math.floor((tonumber(action._when) or 0) + 0.5),
+				hb = action.hitbox,
+			}
+		end
+	end
+	sortActions(draft)
+	return draft
+end
+
+local function newDraft(entry)
+	return {
+		name = defaultName(entry),
+		tag = "Undefined",
+		maxDist = 60,
+		hitbox = Vector3.new(20, 20, 25),
+		actions = {},
+	}
+end
+
+local function getDraft(entry)
+	if entry.draft then
+		return entry.draft
+	end
+	local container = userContainer()
+	local existing = container and container.timings[entry.aid]
+	entry.draft = existing and draftFromTiming(existing, entry) or newDraft(entry)
+	return entry.draft
+end
+
+local function uniqueTimingName(base, ownId)
+	local name = base
+	local n = 1
+	while true do
+		local found = SaveManager.as and SaveManager.as:find(name)
+		if not found or (found._id == ownId) then
+			return name
+		end
+		n = n + 1
+		name = string.format("%s (%d)", base, n)
+	end
+end
+
+local function saveDraft(entry)
+	local draft = getDraft(entry)
+	if #draft.actions == 0 then
+		return notify("Animation Logger: add at least one action before saving.")
+	end
+
+	if not ensureConfig() then
+		return notify("Animation Logger: could not load your '%s' timing file, so nothing was overwritten.", DEFAULT_SAVE_NAME)
+	end
+	local container = userContainer()
+	if not container then
+		return notify("Animation Logger: timing container is not ready yet.")
+	end
+
+	sortActions(draft)
+
+	local timing = AnimationTiming.new()
+	timing._id = entry.aid
+	timing.name = uniqueTimingName(draft.name ~= "" and draft.name or defaultName(entry), entry.aid)
+	timing.tag = draft.tag
+	timing.imdd = 0
+	timing.imxd = draft.maxDist
+	timing.hitbox = draft.hitbox
+
+	local used = {}
+	for _, act in ipairs(draft.actions) do
+		local action = Action.new()
+		action._type = act.type
+		action._when = act.when
+		local base = string.format("%s %dms", act.type, act.when)
+		local name, n = base, 1
+		while used[name] do
+			n = n + 1
+			name = string.format("%s #%d", base, n)
+		end
+		used[name] = true
+		action.name = name
+		action.hitbox = act.hb or draft.hitbox
+		timing.actions:push(action)
+	end
+
+	local previous = container.timings[entry.aid]
+	if previous then
+		container.timings[entry.aid] = nil
+	end
+
+	local ok, err = pcall(container.push, container, timing)
+	if not ok then
+		if previous then
+			container.timings[entry.aid] = previous
+		end
+		return notify("Animation Logger: failed to add timing (%s).", tostring(err))
+	end
+
+	draft.name = timing.name
+	if persist() then
+		notify("Animation Logger: saved '%s' to your timing config.", timing.name)
+	else
+		notify("Animation Logger: added '%s' but writing the config file failed.", timing.name)
+	end
+	rowsDirty = true
+end
+
+local function deleteSaved(entry)
+	local container = userContainer()
+	local existing = container and container.timings[entry.aid]
+	if not existing then
+		return notify("Animation Logger: nothing saved for this animation.")
+	end
+	container.timings[entry.aid] = nil
+	entry.draft = nil
+	if ensureConfig() then
+		persist()
+	end
+	notify("Animation Logger: removed saved timing '%s'.", tostring(existing.name))
+	rowsDirty = true
+end
+
+---------------------------------------------------------------------------
+-- GUI construction
+---------------------------------------------------------------------------
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function themeBox(inst, bgKey)
+	bgKey = bgKey or "MainColor"
+	inst.BackgroundColor3 = Library[bgKey]
+	inst.BorderColor3 = Library.OutlineColor
+	Library:AddToRegistry(inst, { BackgroundColor3 = bgKey, BorderColor3 = "OutlineColor" }, true)
+end
+
+local function themeText(inst, key)
+	key = key or "FontColor"
+	inst.TextColor3 = Library[key]
+	Library:AddToRegistry(inst, { TextColor3 = key }, true)
+end
+
+local function newLabel(parent, text, pos, size, textSize, colorKey)
+	local label = make("TextLabel", {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		FontFace = FONT,
+		Text = text,
+		TextSize = textSize or 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeText(label, colorKey)
+	return label
+end
+
+local function newButton(parent, text, pos, size, callback)
+	local button = make("TextButton", {
+		FontFace = FONT,
+		Text = text,
+		TextSize = 12,
+		AutoButtonColor = true,
+		BorderSizePixel = 1,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeBox(button)
+	themeText(button)
+	if callback then
+		button.MouseButton1Click:Connect(callback)
+	end
+	return button
+end
+
+local function newTextBox(parent, text, pos, size, onCommit)
+	local box = make("TextBox", {
+		FontFace = FONT,
+		Text = text,
+		TextSize = 12,
+		ClearTextOnFocus = false,
+		BorderSizePixel = 1,
+		Position = pos,
+		Size = size,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+	themeBox(box)
+	themeText(box)
+	if onCommit then
+		box.FocusLost:Connect(function(enter)
+			onCommit(box, enter)
+		end)
+	end
+	return box
+end
+
+local function showPreviewMessage(text)
+	if not ui then
+		return
+	end
+	ui.viewport.Visible = false
+	ui.previewMsg.Visible = true
+	ui.previewMsg.Text = text
+end
+
+---------------------------------------------------------------------------
+-- Preview player
+---------------------------------------------------------------------------
+local function clearPreview()
+	if preview and preview.track then
+		pcall(function()
+			preview.track:Stop()
+		end)
+	end
+	preview = nil
+	if ui then
+		for _, child in ipairs(ui.world:GetChildren()) do
+			child:Destroy()
+		end
+	end
+end
+
+local function cloneRig(model)
+	if not model or not model.Parent then
+		return nil
+	end
+	local previous = model.Archivable
+	model.Archivable = true
+	local ok, clone = pcall(function()
+		return model:Clone()
+	end)
+	model.Archivable = previous
+	if not ok or not clone then
+		return nil
+	end
+	for _, descendant in ipairs(clone:GetDescendants()) do
+		if
+			descendant:IsA("LuaSourceContainer")
+			or descendant:IsA("Sound")
+			or descendant:IsA("ParticleEmitter")
+			or descendant:IsA("Trail")
+			or descendant:IsA("Beam")
+			or descendant:IsA("Highlight")
+		then
+			descendant:Destroy()
+		end
+	end
+	return clone
+end
+
+local function positionCamera(clone, root)
+	local _, size = clone:GetBoundingBox()
+	local dist = math.max(size.Magnitude * 1.1, 4)
+	local side = flipView and 1 or -1
+	ui.camera.CFrame = CFrame.lookAt(root.Position + Vector3.new(0, size.Y * 0.1, side * dist), root.Position)
+end
+
+local function loadPreview(entry)
+	clearPreview()
+	loadToken = loadToken + 1
+	local token = loadToken
+	showPreviewMessage("Loading animation...")
+
+	local clone = cloneRig(entry.entity)
+	local fallbackNote = ""
+	if not clone then
+		local character = Players.LocalPlayer and Players.LocalPlayer.Character
+		clone = cloneRig(character)
+		fallbackNote = "  (previewing on your character)"
+	end
+	if not clone then
+		return showPreviewMessage("Could not clone a rig to preview this animation.")
+	end
+
+	clone.Parent = ui.world
+	local root = getRoot(clone)
+	if not root then
+		clone:Destroy()
+		return showPreviewMessage("Rig has no parts to preview.")
+	end
+	pcall(function()
+		if not clone.PrimaryPart then
+			clone.PrimaryPart = root
+		end
+		clone:PivotTo(CFrame.new(0, 0, 0))
+	end)
+	root.Anchored = true
+	positionCamera(clone, root)
+
+	local animator = clone:FindFirstChildWhichIsA("Animator", true)
+	if not animator then
+		local holder = clone:FindFirstChildOfClass("Humanoid") or clone:FindFirstChildOfClass("AnimationController")
+		if not holder then
+			holder = make("AnimationController", {}, clone)
+		end
+		animator = make("Animator", {}, holder)
+	end
+
+	local animation = make("Animation", { AnimationId = entry.raw }, nil)
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(animation)
+	end)
+	if not ok or not track then
+		return showPreviewMessage("Failed to load this animation id.")
+	end
+
+	track.Priority = Enum.AnimationPriority.Action
+	track.Looped = true
+	track:Play(0, 1, 0)
+
+	task.spawn(function()
+		local started = os.clock()
+		while track.Length <= 0 and os.clock() - started < 3 do
+			task.wait()
+		end
+		if token ~= loadToken or not ui then
+			return
+		end
+		local length = track.Length
+		if length <= 0 then
+			return showPreviewMessage("Animation did not load (no access or invalid id).")
+		end
+		entry.length = length
+		preview = {
+			entry = entry,
+			clone = clone,
+			root = root,
+			track = track,
+			length = length,
+			curve = buildCurve(entry.samples, length),
+			elapsed = 0,
+			paused = false,
+			note = fallbackNote,
+		}
+		ui.viewport.Visible = true
+		ui.previewMsg.Visible = false
+		ui.rebuildMarkers()
+		ui.refreshInfo()
+	end)
+end
+
+---------------------------------------------------------------------------
+-- UI: list rows, markers, action rows
+---------------------------------------------------------------------------
+local function rowText(entry)
+	local mark = timingStatus(entry.aid) and '<font color="#5FD068">[+]</font> ' or ""
+	return string.format(
+		'%s<b>%s</b>  x%d  -  %d studs\n<font color="#9A9A9A">%s</font>',
+		mark,
+		esc(entry.entityName or "?"),
+		entry.count,
+		math.floor((entry.distance or 0) + 0.5),
+		esc(entry.aid)
+	)
+end
+
+local function entryVisible(entry)
+	if entry == selected then
+		return true
+	end
+	if settings.hideKnown and timingStatus(entry.aid) then
+		return false
+	end
+	local query = settings.search
+	if query ~= "" then
+		local hay = ((entry.entityName or "") .. " " .. entry.aid):lower()
+		if not hay:find(query, 1, true) then
+			return false
+		end
+	end
+	return true
+end
+
+local function refreshRows()
+	if not ui then
+		return
+	end
+	for _, entry in ipairs(entries) do
+		if not entry.row then
+			local row = make("TextButton", {
+				AutoButtonColor = true,
+				BorderSizePixel = 1,
+				FontFace = FONT,
+				RichText = true,
+				Text = "",
+				TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Center,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Size = UDim2.new(1, -6, 0, 34),
+			}, ui.list)
+			themeBox(row)
+			themeText(row)
+			row.MouseButton1Click:Connect(function()
+				AnimationLogger.select(entry)
+			end)
+			entry.row = row
+		end
+		local row = entry.row
+		row.Text = " " .. rowText(entry)
+		row.LayoutOrder = -math.floor((entry.lastSeen or 0) * 100)
+		row.Visible = entryVisible(entry)
+		row.BackgroundColor3 = (entry == selected) and Library.AccentColor or Library.MainColor
+		row.TextColor3 = (entry == selected) and Color3.new(0, 0, 0) or Library.FontColor
+	end
+	ui.countLabel.Text = string.format("%d logged", #entries)
+	rowsDirty = false
+end
+
+local function rebuildMarkers()
+	if not ui then
+		return
+	end
+	for _, child in ipairs(ui.markerHolder:GetChildren()) do
+		child:Destroy()
+	end
+	if not preview or not selected then
+		return
+	end
+	local draft = getDraft(selected)
+	local total = math.max(preview.curve.total * 1000, 1)
+	for _, act in ipairs(draft.actions) do
+		make("Frame", {
+			BackgroundColor3 = ACTION_COLORS[act.type] or Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Position = UDim2.new(math.clamp(act.when / total, 0, 1), -1, 0, 0),
+			Size = UDim2.new(0, 3, 1, 0),
+			ZIndex = 6,
+		}, ui.markerHolder)
+	end
+end
+
+local function seekMs(ms)
+	if not preview then
+		return
+	end
+	preview.paused = true
+	preview.elapsed = math.clamp(ms / 1000, 0, preview.curve.total)
+end
+
+local function rebuildActionRows()
+	if not ui then
+		return
+	end
+	for _, child in ipairs(ui.actionList:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+	if not selected then
+		return
+	end
+	local draft = getDraft(selected)
+	sortActions(draft)
+	for idx, act in ipairs(draft.actions) do
+		local row = make("Frame", {
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			LayoutOrder = idx,
+			Size = UDim2.new(1, -6, 0, 20),
+		}, ui.actionList)
+
+		make("Frame", {
+			BackgroundColor3 = ACTION_COLORS[act.type] or Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Position = UDim2.new(0, 2, 0, 4),
+			Size = UDim2.new(0, 6, 0, 12),
+		}, row)
+		newLabel(row, act.type, UDim2.new(0, 14, 0, 0), UDim2.new(0, 120, 1, 0), 12)
+		newTextBox(row, tostring(act.when), UDim2.new(0, 140, 0, 1), UDim2.new(0, 64, 0, 18), function(box)
+			local value = tonumber(box.Text)
+			if value then
+				act.when = math.max(math.floor(value + 0.5), 0)
+			end
+			rebuildActionRows()
+			rebuildMarkers()
+		end)
+		newLabel(row, "ms", UDim2.new(0, 208, 0, 0), UDim2.new(0, 24, 1, 0), 12)
+		newButton(row, "Go", UDim2.new(0, 236, 0, 1), UDim2.new(0, 40, 0, 18), function()
+			seekMs(act.when)
+		end)
+		newButton(row, "X", UDim2.new(0, 280, 0, 1), UDim2.new(0, 28, 0, 18), function()
+			table.remove(draft.actions, idx)
+			rebuildActionRows()
+			rebuildMarkers()
+		end)
+	end
+end
+
+local function refreshInfo()
+	if not ui then
+		return
+	end
+	if not selected then
+		ui.info.Text = "Select a logged animation on the left."
+		return
+	end
+	local status = timingStatus(selected.aid)
+	local statusText = status == "user" and "saved (yours)" or status == "builtin" and "built-in timing exists" or "no timing yet"
+	ui.info.Text = string.format(
+		"%s | %s\nlen %.3fs | seen x%d | %s%s",
+		selected.entityName or "?",
+		selected.aid,
+		selected.length or 0,
+		selected.count,
+		statusText,
+		preview and preview.note or ""
+	)
+end
+
+local function refreshSettingsRow()
+	if not ui or not selected then
+		return
+	end
+	local draft = getDraft(selected)
+	ui.nameBox.Text = draft.name
+	ui.tagButton.Text = draft.tag
+	ui.hitboxBox.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
+	ui.distBox.Text = tostring(draft.maxDist)
+end
+
+function AnimationLogger.select(entry)
+	selected = entry
+	holdStartMs = nil
+	if ui then
+		ui.holdButton.Text = "Hold Block"
+	end
+	rowsDirty = true
+	refreshRows()
+	refreshInfo()
+	refreshSettingsRow()
+	rebuildActionRows()
+	loadPreview(entry)
+end
+
+local function addAction(actionType)
+	if not selected then
+		return notify("Animation Logger: select an animation first.")
+	end
+	local ms = preview and math.floor(preview.elapsed * 1000 + 0.5) or 0
+	local draft = getDraft(selected)
+	draft.actions[#draft.actions + 1] = { type = actionType, when = ms }
+	rebuildActionRows()
+	rebuildMarkers()
+end
+
+local function onHoldBlock()
+	if not selected then
+		return notify("Animation Logger: select an animation first.")
+	end
+	local ms = preview and math.floor(preview.elapsed * 1000 + 0.5) or 0
+	local draft = getDraft(selected)
+	if not holdStartMs then
+		holdStartMs = ms
+		draft.actions[#draft.actions + 1] = { type = "Start Block", when = ms }
+		ui.holdButton.Text = "Hold: set END"
+	else
+		draft.actions[#draft.actions + 1] = { type = "End Block", when = math.max(ms, holdStartMs) }
+		holdStartMs = nil
+		ui.holdButton.Text = "Hold Block"
+	end
+	rebuildActionRows()
+	rebuildMarkers()
+end
+
+local function stepMs(delta)
+	if not preview then
+		return
+	end
+	preview.paused = true
+	preview.elapsed = math.clamp(preview.elapsed + delta / 1000, 0, preview.curve.total)
+end
+
+---------------------------------------------------------------------------
+-- Build the window
+---------------------------------------------------------------------------
+local function buildGui()
+	local screenGui = CoreGuiManager.imark(Instance.new("ScreenGui"))
+	screenGui.Name = "AnimationLogger"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.DisplayOrder = 50
+	screenGui.Enabled = false
+	pcall(function()
+		if protectgui then
+			protectgui(screenGui)
+		end
+	end)
+	local okParent = pcall(function()
+		screenGui.Parent = game:GetService("CoreGui")
+	end)
+	if not okParent then
+		screenGui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+	end
+
+	local outer = make("Frame", {
+		Name = "Outer",
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BorderSizePixel = 0,
+		Position = UDim2.new(0.5, -390, 0.5, -260),
+		Size = UDim2.new(0, 780, 0, 520),
+		ZIndex = 2,
+	}, screenGui)
+
+	local inner = make("Frame", {
+		Name = "Inner",
+		BorderMode = Enum.BorderMode.Inset,
+		BorderSizePixel = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+	}, outer)
+	themeBox(inner, "BackgroundColor")
+
+	local accentBar = make("Frame", { BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 2) }, inner)
+	accentBar.BackgroundColor3 = Library.AccentColor
+	Library:AddToRegistry(accentBar, { BackgroundColor3 = "AccentColor" }, true)
+
+	local title = newLabel(inner, "Animation Logger", UDim2.new(0, 8, 0, 4), UDim2.new(0, 200, 0, 22), 15, "AccentColor")
+
+	ui = { screenGui = screenGui, outer = outer }
+
+	ui.logToggle = newButton(
+		inner,
+		enabled and "Logging: ON" or "Logging: OFF",
+		UDim2.new(1, -330, 0, 5),
+		UDim2.new(0, 110, 0, 20),
+		function()
+			local toggle = Toggles and Toggles.AnimationLoggerEnabled
+			if toggle then
+				toggle:SetValue(not toggle.Value)
+			else
+				AnimationLogger.setEnabled(not enabled)
+			end
+		end
+	)
+	newButton(inner, "Clear", UDim2.new(1, -214, 0, 5), UDim2.new(0, 60, 0, 20), function()
+		AnimationLogger.clear()
+	end)
+	ui.countLabel = newLabel(inner, "0 logged", UDim2.new(1, -148, 0, 4), UDim2.new(0, 90, 0, 22), 12)
+	newButton(inner, "X", UDim2.new(1, -30, 0, 5), UDim2.new(0, 24, 0, 20), function()
+		screenGui.Enabled = false
+	end)
+
+	-- Left panel -----------------------------------------------------------
+	ui.search = newTextBox(inner, "", UDim2.new(0, 6, 0, 32), UDim2.new(0, 158, 0, 22), function(box)
+		settings.search = box.Text:lower()
+		rowsDirty = true
+	end)
+	ui.search.PlaceholderText = "search name / id"
+	ui.search.PlaceholderColor3 = Color3.fromRGB(130, 130, 140)
+	ui.hideKnown = newButton(inner, "Hide known: OFF", UDim2.new(0, 168, 0, 32), UDim2.new(0, 88, 0, 22), function()
+		settings.hideKnown = not settings.hideKnown
+		ui.hideKnown.Text = settings.hideKnown and "Hide known: ON" or "Hide known: OFF"
+		rowsDirty = true
+	end)
+	ui.hideKnown.TextSize = 10
+
+	ui.list = make("ScrollingFrame", {
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 6, 0, 58),
+		Size = UDim2.new(0, 250, 1, -64),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 4,
+	}, inner)
+	themeBox(ui.list)
+	ui.list.ScrollBarImageColor3 = Library.AccentColor
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, ui.list)
+	make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingLeft = UDim.new(0, 2) }, ui.list)
+
+	-- Right panel ----------------------------------------------------------
+	local right = make("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 262, 0, 32),
+		Size = UDim2.new(1, -268, 1, -38),
+	}, inner)
+
+	ui.info = newLabel(right, "Select a logged animation on the left.", UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 34), 11)
+	ui.info.TextWrapped = true
+	ui.info.TextYAlignment = Enum.TextYAlignment.Top
+
+	ui.viewport = make("ViewportFrame", {
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 0, 0, 38),
+		Size = UDim2.new(1, 0, 0, 190),
+		Visible = false,
+		Ambient = Color3.fromRGB(80, 80, 80),
+		LightColor = Color3.fromRGB(140, 134, 111),
+	}, right)
+	themeBox(ui.viewport)
+	ui.world = make("WorldModel", {}, ui.viewport)
+	ui.camera = make("Camera", { CameraType = Enum.CameraType.Scriptable, FieldOfView = 70 }, ui.viewport)
+	ui.viewport.CurrentCamera = ui.camera
+
+	ui.previewMsg = make("TextLabel", {
+		FontFace = FONT,
+		Text = "Waiting for an animation...",
+		TextSize = 13,
+		TextWrapped = true,
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 0, 0, 38),
+		Size = UDim2.new(1, 0, 0, 190),
+	}, right)
+	themeBox(ui.previewMsg)
+	themeText(ui.previewMsg)
+
+	-- Timeline ----------------------------------------------------------------
+	ui.timeline = make("Frame", {
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 0, 0, 234),
+		Size = UDim2.new(1, 0, 0, 26),
+	}, right)
+	themeBox(ui.timeline)
+	ui.fill = make("Frame", { BorderSizePixel = 0, Size = UDim2.new(0, 0, 1, 0), BackgroundTransparency = 0.7, ZIndex = 2 }, ui.timeline)
+	ui.fill.BackgroundColor3 = Library.AccentColor
+	Library:AddToRegistry(ui.fill, { BackgroundColor3 = "AccentColor" }, true)
+	ui.markerHolder = make("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), ZIndex = 5 }, ui.timeline)
+	ui.playhead = make("Frame", {
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+		Size = UDim2.new(0, 2, 1, 0),
+		ZIndex = 8,
+	}, ui.timeline)
+	ui.timeLabel = make("TextLabel", {
+		BackgroundTransparency = 1,
+		FontFace = FONT,
+		Text = "0 ms / 0 ms",
+		TextSize = 11,
+		Size = UDim2.new(1, 0, 1, 0),
+		ZIndex = 9,
+		TextStrokeTransparency = 0.5,
+	}, ui.timeline)
+	themeText(ui.timeLabel)
+
+	-- Transport -----------------------------------------------------------------
+	local y = 266
+	ui.playButton = newButton(right, "Pause", UDim2.new(0, 0, 0, y), UDim2.new(0, 70, 0, 22), function()
+		if preview then
+			preview.paused = not preview.paused
+		end
+	end)
+	newButton(right, "-10ms", UDim2.new(0, 76, 0, y), UDim2.new(0, 54, 0, 22), function()
+		stepMs(-10)
+	end)
+	newButton(right, "-1ms", UDim2.new(0, 134, 0, y), UDim2.new(0, 50, 0, 22), function()
+		stepMs(-1)
+	end)
+	newButton(right, "+1ms", UDim2.new(0, 188, 0, y), UDim2.new(0, 50, 0, 22), function()
+		stepMs(1)
+	end)
+	newButton(right, "+10ms", UDim2.new(0, 242, 0, y), UDim2.new(0, 54, 0, 22), function()
+		stepMs(10)
+	end)
+	newButton(right, "Flip view", UDim2.new(0, 302, 0, y), UDim2.new(0, 74, 0, 22), function()
+		flipView = not flipView
+		if preview then
+			positionCamera(preview.clone, preview.root)
+		end
+	end)
+	newLabel(right, "Space = pause   Left/Right = step 10ms", UDim2.new(0, 382, 0, y), UDim2.new(1, -382, 0, 22), 10)
+
+	-- Action palette --------------------------------------------------------------
+	y = 294
+	local palette = { "Parry", "Dodge", "Forced Full Dodge", "Start Block", "End Block", "Jump" }
+	local labels = { "Parry", "Dodge", "Full Dodge", "Start Block", "End Block", "Jump" }
+	local width = 70
+	for idx, actionType in ipairs(palette) do
+		local button = newButton(right, labels[idx], UDim2.new(0, (idx - 1) * (width + 4), 0, y), UDim2.new(0, width, 0, 22), function()
+			addAction(actionType)
+		end)
+		button.TextSize = 11
+		local stripe = make("Frame", {
+			BackgroundColor3 = ACTION_COLORS[actionType],
+			BorderSizePixel = 0,
+			Position = UDim2.new(0, 0, 1, -2),
+			Size = UDim2.new(1, 0, 0, 2),
+		}, button)
+		stripe.ZIndex = button.ZIndex + 1
+	end
+	ui.holdButton = newButton(right, "Hold Block", UDim2.new(0, 6 * (width + 4), 0, y), UDim2.new(0, 86, 0, 22), onHoldBlock)
+	ui.holdButton.TextSize = 11
+
+	-- Action list ---------------------------------------------------------------------
+	ui.actionList = make("ScrollingFrame", {
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 0, 0, 322),
+		Size = UDim2.new(1, 0, 0, 92),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 4,
+	}, right)
+	themeBox(ui.actionList)
+	ui.actionList.ScrollBarImageColor3 = Library.AccentColor
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 0) }, ui.actionList)
+
+	-- Settings row ----------------------------------------------------------------------
+	y = 420
+	ui.nameBox = newTextBox(right, "", UDim2.new(0, 0, 0, y), UDim2.new(0, 200, 0, 22), function(box)
+		if selected then
+			getDraft(selected).name = box.Text
+		end
+	end)
+	ui.nameBox.PlaceholderText = "timing name"
+	ui.tagButton = newButton(right, "Undefined", UDim2.new(0, 204, 0, y), UDim2.new(0, 76, 0, 22), function()
+		if not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		local idx = table.find(TAGS, draft.tag) or 1
+		draft.tag = TAGS[(idx % #TAGS) + 1]
+		ui.tagButton.Text = draft.tag
+	end)
+	newLabel(right, "hitbox", UDim2.new(0, 286, 0, y), UDim2.new(0, 42, 0, 22), 11)
+	ui.hitboxBox = newTextBox(right, "20, 20, 25", UDim2.new(0, 328, 0, y), UDim2.new(0, 96, 0, 22), function(box)
+		if selected then
+			local draft = getDraft(selected)
+			draft.hitbox = parseVector(box.Text, draft.hitbox)
+			box.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
+		end
+	end)
+	newLabel(right, "max dist", UDim2.new(0, 430, 0, y), UDim2.new(0, 52, 0, 22), 11)
+	ui.distBox = newTextBox(right, "60", UDim2.new(0, 482, 0, y), UDim2.new(0, 40, 0, 22), function(box)
+		if selected then
+			local draft = getDraft(selected)
+			draft.maxDist = tonumber(box.Text) or draft.maxDist
+			box.Text = tostring(draft.maxDist)
+		end
+	end)
+
+	-- Save row ----------------------------------------------------------------------------
+	y = 448
+	local saveButton = newButton(right, "Save To Script", UDim2.new(0, 0, 0, y), UDim2.new(0, 170, 0, 26), function()
+		if selected then
+			saveDraft(selected)
+			refreshInfo()
+			refreshRows()
+			rebuildMarkers()
+		else
+			notify("Animation Logger: select an animation first.")
+		end
+	end)
+	saveButton.BackgroundColor3 = Library.AccentColor
+	saveButton.TextColor3 = Color3.new(0, 0, 0)
+	newButton(right, "Delete Saved", UDim2.new(0, 176, 0, y), UDim2.new(0, 110, 0, 26), function()
+		if selected then
+			deleteSaved(selected)
+			refreshInfo()
+			refreshRows()
+			refreshSettingsRow()
+			rebuildActionRows()
+			rebuildMarkers()
+		end
+	end)
+	newButton(right, "Clear Actions", UDim2.new(0, 292, 0, y), UDim2.new(0, 110, 0, 26), function()
+		if selected then
+			getDraft(selected).actions = {}
+			holdStartMs = nil
+			ui.holdButton.Text = "Hold Block"
+			rebuildActionRows()
+			rebuildMarkers()
+		end
+	end)
+	newLabel(right, "Saved timings go live immediately and load every session.", UDim2.new(0, 0, 0, y + 28), UDim2.new(1, 0, 0, 16), 10)
+
+	ui.rebuildMarkers = rebuildMarkers
+	ui.refreshInfo = refreshInfo
+
+	-- Dragging / seeking / hotkeys -------------------------------------------------------------
+	Library:MakeDraggable(outer)
+
+	local function seekFromMouse()
+		if not preview then
+			return
+		end
+		local x = UserInputService:GetMouseLocation().X - ui.timeline.AbsolutePosition.X
+		local frac = math.clamp(x / math.max(ui.timeline.AbsoluteSize.X, 1), 0, 1)
+		preview.elapsed = frac * preview.curve.total
+	end
+
+	ui.timeline.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			if preview then
+				preview.paused = true
+			end
+			seekFromMouse()
+		end
+	end)
+
+	globalConnections[#globalConnections + 1] = UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	outer.InputBegan:Connect(function(input, processed)
+		if processed or not preview then
+			return
+		end
+		if input.KeyCode == Enum.KeyCode.Space then
+			preview.paused = not preview.paused
+		elseif input.KeyCode == Enum.KeyCode.Left then
+			stepMs(-10)
+		elseif input.KeyCode == Enum.KeyCode.Right then
+			stepMs(10)
+		end
+	end)
+
+	globalConnections[#globalConnections + 1] = RunService.RenderStepped:Connect(function(dt)
+		if not screenGui.Enabled then
+			return
+		end
+
+		if rowsDirty and os.clock() - lastRowRefresh > 0.25 then
+			lastRowRefresh = os.clock()
+			refreshRows()
+		end
+
+		ui.playButton.Text = (preview and preview.paused) and "Play" or "Pause"
+
+		if not preview then
+			ui.fill.Size = UDim2.new(0, 0, 1, 0)
+			ui.playhead.Position = UDim2.new(0, 0, 0, 0)
+			ui.timeLabel.Text = "0 ms / 0 ms"
+			return
+		end
+
+		if dragging then
+			seekFromMouse()
+		elseif not preview.paused then
+			preview.elapsed = preview.elapsed + dt
+			if preview.elapsed >= preview.curve.total then
+				preview.elapsed = 0
+			end
+		end
+
+		local tp = math.clamp(tpFromElapsed(preview.curve, preview.elapsed), 0, math.max(preview.length - 0.001, 0))
+		pcall(function()
+			preview.track.TimePosition = tp
+		end)
+
+		local frac = math.clamp(preview.elapsed / preview.curve.total, 0, 1)
+		ui.fill.Size = UDim2.new(frac, 0, 1, 0)
+		ui.playhead.Position = UDim2.new(frac, -1, 0, 0)
+		ui.timeLabel.Text = string.format(
+			"%d ms / %d ms   (anim %.3fs / %.3fs)",
+			math.floor(preview.elapsed * 1000 + 0.5),
+			math.floor(preview.curve.total * 1000 + 0.5),
+			tp,
+			preview.length
+		)
+	end)
+
+	showPreviewMessage("Waiting for an animation...")
+	refreshInfo()
+end
+
+---------------------------------------------------------------------------
+-- Public API
+---------------------------------------------------------------------------
+function AnimationLogger.clear()
+	clearPreview()
+	loadToken = loadToken + 1
+	for _, entry in ipairs(entries) do
+		if entry.row then
+			entry.row:Destroy()
+		end
+	end
+	entries = {}
+	byAid = {}
+	selected = nil
+	holdStartMs = nil
+	if ui then
+		ui.countLabel.Text = "0 logged"
+		showPreviewMessage("Waiting for an animation...")
+		refreshInfo()
+		rebuildActionRows()
+		rebuildMarkers()
+	end
+end
+
+function AnimationLogger.open()
+	if not ui then
+		buildGui()
+	end
+	if not enabled then
+		local toggle = Toggles and Toggles.AnimationLoggerEnabled
+		if toggle then
+			toggle:SetValue(true)
+		else
+			AnimationLogger.setEnabled(true)
+		end
+	end
+	ui.screenGui.Enabled = true
+	rowsDirty = true
+	refreshRows()
+end
+
+function AnimationLogger.close()
+	if ui then
+		ui.screenGui.Enabled = false
+	end
+end
+
+function AnimationLogger.init() end
+
+function AnimationLogger.detach()
+	AnimationLogger.setEnabled(false)
+	disconnectList(globalConnections)
+	clearPreview()
+	if ui and ui.screenGui then
+		pcall(function()
+			ui.screenGui:Destroy()
+		end)
+	end
+	ui = nil
+	entries = {}
+	byAid = {}
+	selected = nil
+end
+
+return AnimationLogger
+end)
 __bundle_register("Menu/ExploitTab", function(require, _LOADED, __bundle_register, __bundle_modules)
 local ExploitTab = {}
 local Icons = require("GUI/Icons")
@@ -81485,6 +82945,37 @@ Callback = function(value)
 detectionRange = value
 end,
 })
+local AnimationLogger = require("Features/Game/AnimationLogger")
+groupbox:AddDivider()
+groupbox:AddToggle("AnimationLoggerEnabled", {
+Text = "Live Animation Logger",
+Tooltip = "Captures animations played near you so you can preview them and assign actions in the Animation Logger window.",
+Default = false,
+Callback = function(value)
+AnimationLogger.setEnabled(value)
+end,
+})
+groupbox:AddToggle("AnimationLoggerIncludeSelf", {
+Text = "Log My Own Animations",
+Default = false,
+Callback = function(value)
+AnimationLogger.setIncludeSelf(value)
+end,
+})
+groupbox:AddSlider("AnimationLoggerRange", {
+Text = "Animation Logger Range",
+Default = 100,
+Min = 10,
+Max = 500,
+Suffix = " studs",
+Rounding = 0,
+Callback = function(value)
+AnimationLogger.setRange(value)
+end,
+})
+groupbox:AddButton("Open Animation Logger", function()
+AnimationLogger.open()
+end)
 end
 function ExploitTab.initLocalCharacterExploitsSection(groupbox)
 local moveWhileKnockedToggle = groupbox:AddToggle("MoveWhileKnocked", {
