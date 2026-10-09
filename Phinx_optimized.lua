@@ -72827,7 +72827,7 @@ optimizeGameMaid["WorldClientRestore"] = function()
 pcall(conn.Enable, conn)
 end
 local last_update = tick()
-optimizeGameMaid["WorldClientRender"] = game:GetService("RunService").PreRender:Connect(function()
+optimizeGameMaid["WorldClientRender"] = runService.PreRender:Connect(function()
 local now = tick()
 local enabled = Configuration.expectToggleValue("OptimizeGame")
 updateLowGraphics(enabled)
@@ -79804,7 +79804,7 @@ Center = true,
 AutoShow = not shared.Lycoris.silent,
 TabPadding = 3,
 MenuFadeTime = 0.0,
-Size = UDim2.fromOffset(680, 620),
+Size = UDim2.fromOffset(560, 570),
 })
 ThemeManager:SetLibrary(Library)
 ThemeManager:SetFolder("Lycoris-Rewrite-Themes")
