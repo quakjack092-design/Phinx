@@ -66603,26 +66603,40 @@ end
 local parts = workspace:GetPartsInPart(simulationPart, overlapParams)
 return shouldManualFilter and checkParts(parts, filter) or #parts > 0, usedCFrame
 end)
-Defender.initial = LPH_NO_VIRTUALIZE(function(self, from, pair, name, key)
+Defender.approachRange = LPH_NO_VIRTUALIZE(function()
+if not Configuration.expectToggleValue("DynamicHitbox") then
+return 0
+end
+return tonumber(Configuration.expectOptionValue("DynamicHitboxApproachRange")) or 0
+end)
+Defender.initial = LPH_NO_VIRTUALIZE(function(self, from, pair, name, key, allowApproach)
 local timing = pair:index(key)
 local distance = self:distance(from)
 if not distance then
 return nil
 end
+local approachMax = nil
 if timing then
 local md = timing.imdd
 if md <= 0.01 then
 md = 0.0
 end
-if distance < md or distance > timing.imxd then
+if distance < md then
 return nil
+end
+if distance > timing.imxd then
+local range = allowApproach and Defender.approachRange() or 0
+if range <= 0 or distance > timing.imxd + range then
+return nil
+end
+approachMax = timing.imxd
 end
 end
 if not timing then
 self:miss(self.__type, key, name, distance, from and tostring(from.Parent) or nil)
 return false
 end
-return timing
+return timing, approachMax
 end)
 Defender.notify = LPH_NO_VIRTUALIZE(function(self, timing, str, ...)
 if not Configuration.expectToggleValue("EnableNotifications") then
@@ -68311,13 +68325,46 @@ hoptions.visualize = options.visualize
 hoptions:ucache()
 local info = RepeatInfo.new(timing, Latency.rdelay(), self:uid(10))
 info.track = self.track
-local hc = self:hc(hoptions, timing.duih and info or nil)
-if hc then
+local approachMax = self._approachMax
+local function inApproachRange()
+if not approachMax then
 return true
 end
-local pc = self:fpc(timing, hoptions)
-if pc then
+local distance = self:distance(self.entity)
+return distance ~= nil and distance <= approachMax + 3.0
+end
+local function evaluate()
+if not inApproachRange() then
+return false
+end
+if self:hc(hoptions, timing.duih and info or nil) then
 return true
+end
+return self:fpc(timing, hoptions) and true or false
+end
+if evaluate() then
+return true
+end
+local graceMs = tonumber(Configuration.expectOptionValue("DynamicHitboxGrace")) or 0
+if timing.duih or not Configuration.expectToggleValue("DynamicHitbox") or graceMs <= 0 then
+return self:notify(timing, "Not in hitbox.")
+end
+local watchedTrack = self.track
+local startedAt = os.clock()
+local deadline = startedAt + graceMs / 1000
+hoptions.hmid = self:uid(10)
+while os.clock() < deadline do
+task.wait()
+if self.track ~= watchedTrack or not self.entity or not root.Parent then
+break
+end
+if self:stopped(watchedTrack, timing, false) then
+break
+end
+if evaluate() then
+self:notify(timing, "Dynamic hitbox: target entered range after %.0fms.", (os.clock() - startedAt) * 1000)
+return true
+end
 end
 return self:notify(timing, "Not in hitbox.")
 end)
@@ -69578,7 +69625,7 @@ local minDist = timing.imdd
 if minDist <= 0.01 then
 minDist = 0
 end
-if distance < minDist or distance > apbMaxDist(timing) then
+if distance < minDist or distance > apbMaxDist(timing) + Defender.approachRange() then
 return nil, aid
 end
 return timing, aid
@@ -70345,6 +70392,7 @@ if not minDist or minDist <= 0.01 then
 minDist = 0
 end
 local maxDist = apbMaxDist(resolved, tonumber(Configuration.expectOptionValue("AutoParryMaxDist")) or 28)
++ Defender.approachRange()
 if not distance or distance < minDist or distance > maxDist then
 resolved = nil
 end
@@ -70555,7 +70603,7 @@ if currentEval and incomingEval and incomingEval.t < currentEval.t then
 return
 end
 end
-local timing = self:initial(self.entity, SaveManager.as, self.entity.Name, aid)
+local timing, approachMax = self:initial(self.entity, SaveManager.as, self.entity.Name, aid, true)
 if Configuration.expectToggleValue("ShowAnimationVisualizer") then
 self.pbdata[track] = PlaybackData.new(self.entity)
 end
@@ -70587,6 +70635,7 @@ end
 self:clean()
 self.timing = timing
 self.track = track
+self._approachMax = approachMax
 self.offset = Latency.rdelay() + (gateDelay or 0)
 self._feintedTrack = nil
 self._galeFeintTracks = nil
@@ -85993,9 +86042,35 @@ expApBreakerDepBox:SetupDependencies({
 { Toggles.ExperimentalAPBreaker, true },
 })
 end
+function CombatTab.initDynamicHitboxSection(groupbox)
+groupbox:AddToggle("DynamicHitbox", {
+Text = "Dynamic Hitbox",
+Default = true,
+Tooltip = "Keeps tracking the attacker instead of checking the hitbox once. Attackers that start outside the hitbox and move in still get defended.",
+})
+groupbox:AddSlider("DynamicHitboxGrace", {
+Text = "Hitbox Grace Window",
+Default = 150,
+Min = 0,
+Max = 500,
+Suffix = "ms",
+Rounding = 0,
+Tooltip = "If the attacker is outside the hitbox when an action is due, keep re-checking for this long and fire the moment they enter it.",
+})
+groupbox:AddSlider("DynamicHitboxApproachRange", {
+Text = "Approach Tracking Range",
+Default = 25,
+Min = 0,
+Max = 60,
+Suffix = " studs",
+Rounding = 0,
+Tooltip = "Also track attacks that start this many studs beyond a timing's max distance. Actions only fire once the attacker is actually in range.",
+})
+end
 function CombatTab.init(window)
 local tab = window:AddTab("Combat", "Combat", Icons.Combat)
 CombatTab.initAutoDefenseSection(tab:AddDynamicGroupbox("Auto Defense"))
+CombatTab.initDynamicHitboxSection(tab:AddDynamicGroupbox("Dynamic Hitbox"))
 local tabbox = tab:AddDynamicTabbox()
 CombatTab.initCombatTargetingSection(tabbox:AddTab("Targeting"))
 CombatTab.initCombatWhitelistSection(tabbox:AddTab("Whitelisting"))
