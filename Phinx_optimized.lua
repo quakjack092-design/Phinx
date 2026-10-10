@@ -2846,6 +2846,8 @@ local Toggles = {}
 local Options = {}
 local ColorPickers = {}
 local Entries = {}
+local EntryCount = 0
+local MAX_PENDING_ENTRIES = 120
 local ContextMenus = {}
 local Tooltips = {}
 local ModeSelectFrames = {}
@@ -2894,11 +2896,18 @@ RenderStepped:Connect(function(Delta)
 if Toggles.ShowLoggerWindow and not Toggles.ShowLoggerWindow.Value then
 if next(Entries) ~= nil then
 Entries = {}
+EntryCount = 0
 end
 end
 local NextIndex, NextEntry = next(Entries)
+if NextIndex == nil and EntryCount ~= 0 then
+EntryCount = 0
+end
 if NextIndex and NextEntry then
 Entries[NextIndex] = nil
+if EntryCount > 0 then
+EntryCount = EntryCount - 1
+end
 NextEntry()
 end
 RainbowStep = RainbowStep + Delta
@@ -3080,6 +3089,10 @@ local bl = ifd.KeyBlacklistList
 if bl[key] then
 return
 end
+if EntryCount >= MAX_PENDING_ENTRIES then
+return
+end
+EntryCount = EntryCount + 1
 table.insert(Entries, 1, function()
 debug.profilebegin("Library:AddMissEntry")
 local function getEntriesForThisType()
@@ -17039,6 +17052,8 @@ local defenderPartObjects = {}
 local defenderAnimationObjects = {}
 local defenderObjects = {}
 local deletedPlaybackData = {}
+local deletedPlaybackOrder = {}
+local MAX_DELETED_PLAYBACK = 256
 local mobAnimations = {}
 local WISP_INPUT_MAP = { Z = 1, X = 2, C = 3, V = 4 }
 local cws = nil
@@ -17097,7 +17112,14 @@ local object = defenderObjects[descendant]
 if not object then
 return
 end
-if object.rpbdata then
+if object.rpbdata and next(object.rpbdata) ~= nil then
+if deletedPlaybackData[descendant] == nil then
+deletedPlaybackOrder[#deletedPlaybackOrder + 1] = descendant
+if #deletedPlaybackOrder > MAX_DELETED_PLAYBACK then
+local oldest = table.remove(deletedPlaybackOrder, 1)
+deletedPlaybackData[oldest] = nil
+end
+end
 deletedPlaybackData[descendant] = object.rpbdata
 end
 if defenderPartObjects[descendant] then
@@ -18013,6 +18035,7 @@ table.clear(defenderObjects)
 table.clear(defenderPartObjects)
 table.clear(defenderAnimationObjects)
 table.clear(deletedPlaybackData)
+table.clear(deletedPlaybackOrder)
 defenseMaid:clean()
 Logger.warn("Defense detached.")
 end
@@ -18247,7 +18270,7 @@ return Target
 end)
 __bundle_register("Features/Combat/EntityHistory", function(require, _LOADED, __bundle_register, __bundle_modules)
 local EntityHistory = {}
-local histories = {}
+local histories = setmetatable({}, { __mode = "k" })
 local MAX_HISTORY_SECS = 3.0
 EntityHistory.add = LPH_NO_VIRTUALIZE(function(idx, position, velocity, timestamp)
 local history = histories[idx] or {}
@@ -72520,6 +72543,7 @@ local AnimationVisualizer = require("Features/Game/AnimationVisualizer")
 local AnimationLogger = require("Features/Game/AnimationLogger")
 local SoundLogger = require("Features/Game/SoundLogger")
 local EffectLogger = require("Features/Game/EffectLogger")
+local DamageLogger = require("Features/Game/DamageLogger")
 local FishFarm = require("Features/Automation/FishFarm")
 local Teleport = require("Features/Game/Teleport")
 local AutoLoot = require("Features/Automation/AutoLoot")
@@ -72557,6 +72581,7 @@ function Features.detach()
 AnimationLogger.detach()
 SoundLogger.detach()
 EffectLogger.detach()
+DamageLogger.detach()
 if not armorshield or armorshield.current_role == "builder" then
 AnimationVisualizer.detach()
 end
@@ -73062,7 +73087,22 @@ end
 end)
 local descendantAddedSignal = Signal.new(game.DescendantAdded)
 optimizeGameMaid:add(descendantAddedSignal:connect("OptimizeGame_DescendantAdded", function(obj)
-if ranVisuals then
+if ranVisuals and (
+obj:IsA("BasePart")
+or obj:IsA("Decal")
+or obj:IsA("Texture")
+or obj:IsA("SurfaceAppearance")
+or obj:IsA("SpecialMesh")
+or obj:IsA("ParticleEmitter")
+or obj:IsA("Trail")
+or obj:IsA("Beam")
+or obj:IsA("Smoke")
+or obj:IsA("Fire")
+or obj:IsA("Sparkles")
+or obj:IsA("PointLight")
+or obj:IsA("SpotLight")
+or obj:IsA("SurfaceLight")
+) then
 task.defer(downgradeObject, obj)
 end
 end))
@@ -77262,7 +77302,12 @@ noAnimatedSeaMap:add(descendant, "Enabled", false)
 end
 end)
 local updateTerrainAttachments = LPH_NO_VIRTUALIZE(function()
-for _, attachment in next, attachments do
+for index = #attachments, 1, -1 do
+local attachment = attachments[index]
+if not attachment.Parent then
+table.remove(attachments, index)
+continue
+end
 local jtg = attachment:FindFirstChild("JobTrackerGui")
 if not jtg then
 continue
@@ -82502,7 +82547,7 @@ local function refreshInfo()
 		selected.aid,
 		selected.length or 0,
 		selected.count,
-		statusText,
+		statusText .. (selected.hint and (" | " .. selected.hint) or ""),
 		preview and preview.note or ""
 	)
 end
@@ -82975,6 +83020,37 @@ function AnimationLogger.clear()
 		rebuildActionRows()
 		rebuildMarkers()
 	end
+end
+
+function AnimationLogger.inject(data)
+	local aid = canonicalAid(data.raw or data.key)
+	local entry = byAid[aid]
+	if not entry then
+		entry = {
+			aid = aid,
+			raw = data.raw or aid,
+			count = 0,
+			length = 0,
+			samples = nil,
+			draft = nil,
+			lastSeen = os.clock(),
+			entityName = "Unknown",
+			distance = 0,
+		}
+		byAid[aid] = entry
+		entries[#entries + 1] = entry
+	end
+	entry.raw = data.raw or entry.raw
+	entry.entityName = data.entityName or entry.entityName
+	entry.distance = data.distance or entry.distance
+	if (data.length or 0) > 0 then
+		entry.length = data.length
+	end
+	entry.count = math.max(entry.count, data.count or 1)
+	entry.hint = data.hint
+	entry.lastSeen = os.clock()
+	rowsDirty = true
+	return entry
 end
 
 function AnimationLogger.open()
@@ -83975,7 +84051,7 @@ local function create(kind)
 			selected.key,
 			lengthText,
 			selected.count,
-			statusText
+			statusText .. (selected.hint and (" | " .. selected.hint) or "")
 		)
 	end
 
@@ -84489,6 +84565,21 @@ local function create(kind)
 	-----------------------------------------------------------------------
 	-- Public API
 	-----------------------------------------------------------------------
+	function api.inject(data)
+		local entry = recordEntry(data.key)
+		entry.count = math.max(data.count or 1, 1)
+		entry.entityName = data.entityName or entry.entityName
+		entry.distance = data.distance or entry.distance
+		if (data.length or 0) > 0 then
+			entry.length = data.length
+		end
+		if data.info and data.info ~= "" and (entry.info == nil or entry.info == "") then
+			entry.info = data.info
+		end
+		entry.hint = data.hint
+		return entry
+	end
+
 	function api.clear()
 		clearPreview()
 		loadToken = loadToken + 1
@@ -84555,6 +84646,977 @@ end
 
 return create
 end)
+__bundle_register("Features/Game/DamageLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
+local DamageLogger = {}
+
+local Library = require("GUI/Library")
+local CoreGuiManager = require("Utility/CoreGuiManager")
+local SaveManager = require("Game/Timings/SaveManager")
+local Filesystem = require("Utility/Filesystem")
+local Logger = require("Utility/Logger")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+
+---------------------------------------------------------------------------
+-- Constants / state
+---------------------------------------------------------------------------
+local FOLDER = "Lycoris-Rewrite-DamageLog"
+local FILE = "culprits.json"
+local EVENT_KEEP = 4.0
+local MAX_EVENTS = 600
+local MAX_CULPRITS = 400
+local MAX_PER_HIT = 8
+local EFFECT_SOURCES = { "ClientEffect", "ClientEffectLarge", "ClientEffectDirect" }
+local FONT = Font.new("rbxasset://fonts/families/RobotoMono.json")
+
+local KIND_TAG = {
+	Animation = '<font color="#7FB4FF">[ANIM]</font>',
+	Effect = '<font color="#FFB04F">[FX]</font>',
+	Sound = '<font color="#7FE0A0">[SND]</font>',
+}
+local KIND_FILTERS = { "All", "Animation", "Effect", "Sound" }
+local KIND_LABELS = { All = "All", Animation = "Anim", Effect = "Effects", Sound = "Sounds" }
+
+local settings = { range = 60, minDamage = 3, window = 1.5 }
+
+local enabled = false
+local events = {}
+local lastPrune = 0
+local culprits = {}
+local loaded = false
+local saveScheduled = false
+
+local liveConnections = {}
+local globalConnections = {}
+local hooked = setmetatable({}, { __mode = "k" })
+local healthConn = nil
+local lastHealth = nil
+
+local ui = nil
+local selected = nil
+local rowsDirty = false
+local lastRowRefresh = 0
+local filterKind = "All"
+local hideKnown = false
+
+local fs = Filesystem.new(FOLDER)
+
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+local function notify(fmt, ...)
+	pcall(Logger.notify, fmt, ...)
+end
+
+local function esc(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function canonicalAid(raw)
+	local text = tostring(raw or "")
+	local plain = text:match("^rbxassetid://(%d+)$")
+	if plain then
+		return "rbxassetid://" .. plain
+	end
+	local id = text:match("[?&]id=(%d+)")
+	if id and (text:find("^rbxassetid://") or text:find("^https?://") or text:find("^rbxasset://")) then
+		return "rbxassetid://" .. id
+	end
+	return text
+end
+
+local function getRoot(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function resolveEntity(animator)
+	local node = animator.Parent
+	local fallback = nil
+	while node and node ~= Workspace do
+		if node:IsA("Model") then
+			fallback = fallback or node
+			if node:FindFirstChildOfClass("Humanoid") or node:FindFirstChild("HumanoidRootPart") then
+				return node
+			end
+		end
+		node = node.Parent
+	end
+	return fallback
+end
+
+local function localRoot()
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function distanceToPart(part)
+	local root = localRoot()
+	if not part then
+		return nil
+	end
+	if not root then
+		return 0
+	end
+	return (part.Position - root.Position).Magnitude
+end
+
+local function timingKnown(rec)
+	local pair = (rec.kind == "Animation" and SaveManager.as) or (rec.kind == "Sound" and SaveManager.ss) or SaveManager.es
+	if not pair then
+		return false
+	end
+	local ok, timing = pcall(pair.index, pair, rec.key)
+	return ok and timing ~= nil
+end
+
+---------------------------------------------------------------------------
+-- Persistence of the culprit list
+---------------------------------------------------------------------------
+local function saveLog()
+	local list = {}
+	for _, rec in next, culprits do
+		list[#list + 1] = rec
+	end
+	local ok, json = pcall(HttpService.JSONEncode, HttpService, list)
+	if ok then
+		pcall(fs.write, fs, FILE, json)
+	end
+end
+
+local function scheduleSave()
+	if saveScheduled then
+		return
+	end
+	saveScheduled = true
+	task.delay(3, function()
+		saveScheduled = false
+		saveLog()
+	end)
+end
+
+local function loadLog()
+	if loaded then
+		return
+	end
+	loaded = true
+	local ok, raw = pcall(fs.read, fs, FILE)
+	if not ok or type(raw) ~= "string" then
+		return
+	end
+	local okDecode, list = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not okDecode or type(list) ~= "table" then
+		return
+	end
+	for _, rec in ipairs(list) do
+		if type(rec) == "table" and rec.id and rec.kind and rec.key then
+			rec.names = type(rec.names) == "table" and rec.names or {}
+			rec.hits = tonumber(rec.hits) or 0
+			rec.top = tonumber(rec.top) or 0
+			rec.sumMs = tonumber(rec.sumMs) or 0
+			rec.minMs = tonumber(rec.minMs) or 99999
+			rec.maxMs = tonumber(rec.maxMs) or 0
+			rec.sumDist = tonumber(rec.sumDist) or 0
+			rec.length = tonumber(rec.length) or 0
+			rec.last = tonumber(rec.last) or 0
+			culprits[rec.id] = rec
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- Rolling history of what happened near you
+---------------------------------------------------------------------------
+local function pushEvent(ev)
+	events[#events + 1] = ev
+	if ev.t - lastPrune > 1 or #events > MAX_EVENTS then
+		lastPrune = ev.t
+		local cutoff = ev.t - EVENT_KEEP
+		local kept = {}
+		for _, existing in ipairs(events) do
+			if existing.t >= cutoff then
+				kept[#kept + 1] = existing
+			end
+		end
+		while #kept > MAX_EVENTS do
+			table.remove(kept, 1)
+		end
+		events = kept
+	end
+end
+
+local function onAnimationPlayed(animator, track)
+	if not enabled or not track then
+		return
+	end
+	local animation = track.Animation
+	if not animation then
+		return
+	end
+	local raw = tostring(animation.AnimationId)
+	if raw == "" or track.Looped then
+		return
+	end
+	local priority = track.Priority
+	if priority == Enum.AnimationPriority.Core or priority == Enum.AnimationPriority.Idle then
+		return
+	end
+	local model = resolveEntity(animator)
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	if not model or model == character then
+		return
+	end
+	local distance = distanceToPart(getRoot(model))
+	if not distance or distance > settings.range then
+		return
+	end
+	pushEvent({
+		t = os.clock(),
+		kind = "Animation",
+		key = canonicalAid(raw),
+		raw = raw,
+		name = model.Name,
+		distance = distance,
+		length = tonumber(track.Length) or 0,
+	})
+end
+
+local function hookAnimator(animator)
+	if hooked[animator] then
+		return
+	end
+	hooked[animator] = animator.AnimationPlayed:Connect(function(track)
+		onAnimationPlayed(animator, track)
+	end)
+	animator.Destroying:Connect(function()
+		local existing = hooked[animator]
+		if existing then
+			existing:Disconnect()
+			hooked[animator] = nil
+		end
+	end)
+end
+
+local function onSoundPlayed(sound)
+	if not enabled then
+		return
+	end
+	local id = tostring(sound.SoundId)
+	if id == "" then
+		return
+	end
+	local part = sound:FindFirstAncestorWhichIsA("BasePart")
+	if not part then
+		return
+	end
+	local model = sound:FindFirstAncestorWhichIsA("Model")
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	if model and character and model == character then
+		return
+	end
+	local distance = distanceToPart(part)
+	if not distance or distance > settings.range then
+		return
+	end
+	pushEvent({
+		t = os.clock(),
+		kind = "Sound",
+		key = id,
+		raw = id,
+		name = model and model.Name or part.Name,
+		distance = distance,
+		length = tonumber(sound.TimeLength) or 0,
+	})
+end
+
+local function hookSound(sound, fireNow)
+	if hooked[sound] then
+		return
+	end
+	hooked[sound] = sound.Played:Connect(function()
+		onSoundPlayed(sound)
+	end)
+	sound.Destroying:Connect(function()
+		local existing = hooked[sound]
+		if existing then
+			existing:Disconnect()
+			hooked[sound] = nil
+		end
+	end)
+	if fireNow and sound.IsPlaying then
+		onSoundPlayed(sound)
+	end
+end
+
+local function onEffectEvent(name, data)
+	if not enabled or typeof(name) ~= "string" or name == "" or typeof(data) ~= "table" then
+		return
+	end
+	local live = Workspace:FindFirstChild("Live")
+	if not live then
+		return
+	end
+	local owner = nil
+	for _, value in next, data do
+		if typeof(value) == "Instance" and value.Parent == live then
+			owner = value
+			break
+		end
+	end
+	if not owner then
+		return
+	end
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	if character and owner == character then
+		return
+	end
+	local distance = distanceToPart(getRoot(owner))
+	if not distance or distance > settings.range then
+		return
+	end
+	pushEvent({
+		t = os.clock(),
+		kind = "Effect",
+		key = name,
+		raw = name,
+		name = owner.Name,
+		distance = distance,
+		length = 0,
+	})
+end
+
+---------------------------------------------------------------------------
+-- Attribution: what was happening right before you lost health?
+---------------------------------------------------------------------------
+local function record(ev, ms, isTop)
+	local id = ev.kind .. "|" .. ev.key
+	local rec = culprits[id]
+	if not rec then
+		local count = 0
+		for _ in next, culprits do
+			count = count + 1
+		end
+		if count >= MAX_CULPRITS then
+			local worstId, worstScore = nil, math.huge
+			for otherId, other in next, culprits do
+				local score = other.top * 100 + other.hits
+				if score < worstScore then
+					worstId, worstScore = otherId, score
+				end
+			end
+			if worstId then
+				culprits[worstId] = nil
+			end
+		end
+		rec = {
+			id = id,
+			kind = ev.kind,
+			key = ev.key,
+			raw = ev.raw,
+			names = {},
+			hits = 0,
+			top = 0,
+			sumMs = 0,
+			minMs = 99999,
+			maxMs = 0,
+			sumDist = 0,
+			length = 0,
+			last = 0,
+		}
+		culprits[id] = rec
+	end
+	rec.hits = rec.hits + 1
+	if isTop then
+		rec.top = rec.top + 1
+	end
+	rec.sumMs = rec.sumMs + ms
+	rec.minMs = math.min(rec.minMs, ms)
+	rec.maxMs = math.max(rec.maxMs, ms)
+	rec.sumDist = rec.sumDist + ev.distance
+	if (ev.length or 0) > rec.length then
+		rec.length = ev.length
+	end
+	rec.last = os.time()
+	if ev.name and #rec.names < 3 and not table.find(rec.names, ev.name) then
+		rec.names[#rec.names + 1] = ev.name
+	end
+end
+
+local function attribute(amount)
+	local now = os.clock()
+	local candidates, seen = {}, {}
+	for i = #events, 1, -1 do
+		local ev = events[i]
+		local age = now - ev.t
+		if age > settings.window then
+			break
+		end
+		local maxAge = settings.window
+		if (ev.length or 0) > 0 then
+			maxAge = math.min(settings.window, ev.length + 0.35)
+		end
+		if age <= maxAge then
+			local id = ev.kind .. "|" .. ev.key
+			if not seen[id] then
+				seen[id] = true
+				ev.rank = ev.distance + age * 8
+				candidates[#candidates + 1] = ev
+			end
+		end
+	end
+	if #candidates == 0 then
+		return
+	end
+	table.sort(candidates, function(a, b)
+		return a.rank < b.rank
+	end)
+	local bestOfKind = {}
+	for _, ev in ipairs(candidates) do
+		if not bestOfKind[ev.kind] then
+			bestOfKind[ev.kind] = ev
+		end
+	end
+	for index, ev in ipairs(candidates) do
+		if index > MAX_PER_HIT then
+			break
+		end
+		record(ev, (now - ev.t) * 1000, bestOfKind[ev.kind] == ev)
+	end
+	rowsDirty = true
+	scheduleSave()
+end
+
+local function onHealthChanged(health)
+	local previous = lastHealth or health
+	lastHealth = health
+	local drop = previous - health
+	if enabled and drop >= settings.minDamage then
+		task.defer(attribute, drop)
+	end
+end
+
+local function watchCharacter(character)
+	if healthConn then
+		healthConn:Disconnect()
+		healthConn = nil
+	end
+	if not character then
+		return
+	end
+	local humanoid = character:WaitForChild("Humanoid", 5)
+	if not humanoid then
+		return
+	end
+	lastHealth = humanoid.Health
+	healthConn = humanoid.HealthChanged:Connect(onHealthChanged)
+end
+
+---------------------------------------------------------------------------
+-- Capture control
+---------------------------------------------------------------------------
+local function disconnectList(list)
+	for _, connection in ipairs(list) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(list)
+end
+
+local function connectEffectSources()
+	local requests = ReplicatedStorage:FindFirstChild("Requests")
+	if not requests then
+		return
+	end
+	for _, sourceName in ipairs(EFFECT_SOURCES) do
+		local source = requests:FindFirstChild(sourceName)
+		local signal = nil
+		if source and source:IsA("BindableEvent") then
+			signal = source.Event
+		elseif source and (source:IsA("RemoteEvent") or source:IsA("UnreliableRemoteEvent")) then
+			signal = source.OnClientEvent
+		end
+		if signal then
+			liveConnections[#liveConnections + 1] = signal:Connect(function(...)
+				pcall(onEffectEvent, ...)
+			end)
+		end
+	end
+end
+
+function DamageLogger.setEnabled(state)
+	state = state and true or false
+	if state == enabled then
+		return
+	end
+	enabled = state
+	if ui and ui.logToggle then
+		ui.logToggle.Text = enabled and "Logging: ON" or "Logging: OFF"
+	end
+
+	if not enabled then
+		disconnectList(liveConnections)
+		for instance, connection in next, hooked do
+			pcall(function()
+				connection:Disconnect()
+			end)
+			hooked[instance] = nil
+		end
+		if healthConn then
+			healthConn:Disconnect()
+			healthConn = nil
+		end
+		table.clear(events)
+		saveLog()
+		return
+	end
+
+	loadLog()
+	for _, descendant in ipairs(Workspace:GetDescendants()) do
+		if descendant:IsA("Animator") then
+			hookAnimator(descendant)
+		elseif descendant:IsA("Sound") then
+			hookSound(descendant, false)
+		end
+	end
+	liveConnections[#liveConnections + 1] = Workspace.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("Animator") then
+			hookAnimator(descendant)
+		elseif descendant:IsA("Sound") then
+			hookSound(descendant, true)
+		end
+	end)
+	connectEffectSources()
+
+	local localPlayer = Players.LocalPlayer
+	if localPlayer then
+		task.spawn(watchCharacter, localPlayer.Character)
+		liveConnections[#liveConnections + 1] = localPlayer.CharacterAdded:Connect(function(character)
+			task.spawn(watchCharacter, character)
+		end)
+	end
+end
+
+function DamageLogger.setRange(value)
+	settings.range = tonumber(value) or settings.range
+end
+
+function DamageLogger.setMinDamage(value)
+	settings.minDamage = tonumber(value) or settings.minDamage
+end
+
+---------------------------------------------------------------------------
+-- GUI
+---------------------------------------------------------------------------
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function themeBox(inst, bgKey)
+	bgKey = bgKey or "MainColor"
+	inst.BackgroundColor3 = Library[bgKey]
+	inst.BorderColor3 = Library.OutlineColor
+	Library:AddToRegistry(inst, { BackgroundColor3 = bgKey, BorderColor3 = "OutlineColor" }, true)
+end
+
+local function themeText(inst, key)
+	key = key or "FontColor"
+	inst.TextColor3 = Library[key]
+	Library:AddToRegistry(inst, { TextColor3 = key }, true)
+end
+
+local function newLabel(parent, text, pos, size, textSize, colorKey)
+	local label = make("TextLabel", {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		FontFace = FONT,
+		Text = text,
+		TextSize = textSize or 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeText(label, colorKey)
+	return label
+end
+
+local function newButton(parent, text, pos, size, callback)
+	local button = make("TextButton", {
+		FontFace = FONT,
+		Text = text,
+		TextSize = 12,
+		AutoButtonColor = true,
+		BorderSizePixel = 1,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeBox(button)
+	themeText(button)
+	if callback then
+		button.MouseButton1Click:Connect(callback)
+	end
+	return button
+end
+
+local function sortedRecords()
+	local list = {}
+	for _, rec in next, culprits do
+		list[#list + 1] = rec
+	end
+	return list
+end
+
+local function recVisible(rec)
+	if rec == selected then
+		return true
+	end
+	if filterKind ~= "All" and rec.kind ~= filterKind then
+		return false
+	end
+	if hideKnown and timingKnown(rec) then
+		return false
+	end
+	return true
+end
+
+local function rowText(rec)
+	local mark = timingKnown(rec) and '<font color="#5FD068">[+]</font> ' or ""
+	local avg = rec.hits > 0 and math.floor(rec.sumMs / rec.hits + 0.5) or 0
+	return string.format(
+		" %s%s <b>%s</b>  best x%d / seen x%d\n <font color=\"#9A9A9A\">%s  (~%dms)</font>",
+		mark,
+		KIND_TAG[rec.kind] or "",
+		esc(rec.names[1] or "?"),
+		rec.top,
+		rec.hits,
+		esc(rec.key),
+		avg
+	)
+end
+
+local function detailText(rec)
+	if not rec then
+		return "Select an entry on the left.\n\nThe log fills in whenever you lose health: it records the animations, effects and sounds that happened near you in the moments before the hit."
+	end
+	local hits = math.max(rec.hits, 1)
+	local status = "no timing yet"
+	if timingKnown(rec) then
+		local container = (rec.kind == "Animation" and SaveManager.as) or (rec.kind == "Sound" and SaveManager.ss) or SaveManager.es
+		local mine = container and container.config and container.config.timings[rec.key]
+		status = mine and "saved (yours)" or "built-in timing exists"
+	end
+	local ago = rec.last > 0 and math.max(os.time() - rec.last, 0) or 0
+	local agoText = ago < 90 and (ago .. "s ago") or ago < 5400 and (math.floor(ago / 60) .. "m ago") or (math.floor(ago / 3600) .. "h ago")
+	return string.format(
+		"%s <b>%s</b>\nid: %s\n\nNear the damage: %d times (best match %d times)\nDamage landed: ~%dms after it started (%d - %d)\nAverage distance: %.1f studs\nAnimation/sound length: %s\nSeen from: %s\nTiming: %s\nLast hit: %s",
+		KIND_TAG[rec.kind] or "",
+		esc(rec.names[1] or "?"),
+		esc(rec.key),
+		rec.hits,
+		rec.top,
+		math.floor(rec.sumMs / hits + 0.5),
+		math.floor(rec.minMs + 0.5),
+		math.floor(rec.maxMs + 0.5),
+		rec.sumDist / hits,
+		rec.length > 0 and string.format("%.3fs", rec.length) or "unknown",
+		esc(#rec.names > 0 and table.concat(rec.names, ", ") or "?"),
+		status,
+		agoText
+	)
+end
+
+local function refreshRows()
+	if not ui then
+		return
+	end
+	local total = 0
+	for id, rec in next, culprits do
+		total = total + 1
+		local row = ui.rows[id]
+		if not row then
+			row = make("TextButton", {
+				AutoButtonColor = true,
+				BorderSizePixel = 1,
+				FontFace = FONT,
+				RichText = true,
+				Text = "",
+				TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Center,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Size = UDim2.new(1, -6, 0, 34),
+			}, ui.list)
+			themeBox(row)
+			themeText(row)
+			row.MouseButton1Click:Connect(function()
+				DamageLogger.select(rec)
+			end)
+			ui.rows[id] = row
+		end
+		row.Text = rowText(rec)
+		row.LayoutOrder = -(rec.top * 1000 + rec.hits)
+		row.Visible = recVisible(rec)
+		row.BackgroundColor3 = (rec == selected) and Library.AccentColor or Library.MainColor
+		row.TextColor3 = (rec == selected) and Color3.new(0, 0, 0) or Library.FontColor
+	end
+	for id, row in next, ui.rows do
+		if not culprits[id] then
+			row:Destroy()
+			ui.rows[id] = nil
+		end
+	end
+	ui.countLabel.Text = string.format("%d logged", total)
+	ui.details.Text = detailText(selected)
+	rowsDirty = false
+end
+
+function DamageLogger.select(rec)
+	selected = rec
+	rowsDirty = true
+	refreshRows()
+end
+
+local function openInBuilder(rec)
+	if not rec then
+		return notify("Damage Log: select an entry first.")
+	end
+	local hits = math.max(rec.hits, 1)
+	local avgMs = math.floor(rec.sumMs / hits + 0.5)
+	local data = {
+		key = rec.key,
+		raw = rec.raw or rec.key,
+		entityName = rec.names[1] or "?",
+		distance = rec.sumDist / hits,
+		length = rec.length,
+		count = rec.hits,
+		hint = string.format("hit you @%dms x%d", avgMs, rec.hits),
+		info = string.format("damaged you ~%dms after it started (%d times)", avgMs, rec.hits),
+	}
+	local ok, err = pcall(function()
+		local logger
+		if rec.kind == "Animation" then
+			logger = require("Features/Game/AnimationLogger")
+		elseif rec.kind == "Sound" then
+			logger = require("Features/Game/SoundLogger")
+		else
+			logger = require("Features/Game/EffectLogger")
+		end
+		local entry = logger.inject(data)
+		logger.open()
+		logger.select(entry)
+	end)
+	if not ok then
+		notify("Damage Log: could not open the builder (%s).", tostring(err))
+	end
+end
+
+local function buildGui()
+	local screenGui = CoreGuiManager.imark(Instance.new("ScreenGui"))
+	screenGui.Name = "DamageLogger"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.DisplayOrder = 50
+	screenGui.Enabled = false
+	pcall(function()
+		if protectgui then
+			protectgui(screenGui)
+		end
+	end)
+	local okParent = pcall(function()
+		screenGui.Parent = game:GetService("CoreGui")
+	end)
+	if not okParent then
+		screenGui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+	end
+
+	local outer = make("Frame", {
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BorderSizePixel = 0,
+		Position = UDim2.new(0.5, -330, 0.5, -215),
+		Size = UDim2.new(0, 660, 0, 430),
+		ZIndex = 2,
+	}, screenGui)
+	local inner = make("Frame", {
+		BorderMode = Enum.BorderMode.Inset,
+		BorderSizePixel = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+	}, outer)
+	themeBox(inner, "MainColor")
+	local line = make("Frame", { BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 2), ZIndex = 3 }, inner)
+	line.BackgroundColor3 = Library.AccentColor
+	Library:AddToRegistry(line, { BackgroundColor3 = "AccentColor" }, true)
+	newLabel(inner, "Damage Log", UDim2.new(0, 8, 0, 3), UDim2.new(0, 200, 0, 22), 14)
+
+	ui = { screenGui = screenGui, rows = {} }
+
+	ui.logToggle = newButton(
+		inner,
+		enabled and "Logging: ON" or "Logging: OFF",
+		UDim2.new(1, -250, 0, 5),
+		UDim2.new(0, 110, 0, 20),
+		function()
+			local toggle = Toggles and Toggles.DamageLoggerEnabled
+			if toggle then
+				toggle:SetValue(not toggle.Value)
+			else
+				DamageLogger.setEnabled(not enabled)
+			end
+		end
+	)
+	newButton(inner, "Clear All", UDim2.new(1, -134, 0, 5), UDim2.new(0, 70, 0, 20), function()
+		culprits = {}
+		selected = nil
+		saveLog()
+		rowsDirty = true
+		refreshRows()
+	end)
+	newButton(inner, "X", UDim2.new(1, -30, 0, 5), UDim2.new(0, 24, 0, 20), function()
+		screenGui.Enabled = false
+	end)
+	ui.countLabel = newLabel(inner, "0 logged", UDim2.new(1, -330, 0, 4), UDim2.new(0, 70, 0, 22), 11)
+
+	-- Left: filters + list ---------------------------------------------------
+	local x = 6
+	ui.filterButtons = {}
+	for _, kind in ipairs(KIND_FILTERS) do
+		local button = newButton(inner, KIND_LABELS[kind], UDim2.new(0, x, 0, 32), UDim2.new(0, 58, 0, 22), function()
+			filterKind = kind
+			for otherKind, otherButton in next, ui.filterButtons do
+				otherButton.BackgroundColor3 = (otherKind == kind) and Library.AccentColor or Library.MainColor
+				otherButton.TextColor3 = (otherKind == kind) and Color3.new(0, 0, 0) or Library.FontColor
+			end
+			rowsDirty = true
+		end)
+		button.TextSize = 11
+		ui.filterButtons[kind] = button
+		x = x + 60
+	end
+	ui.filterButtons.All.BackgroundColor3 = Library.AccentColor
+	ui.filterButtons.All.TextColor3 = Color3.new(0, 0, 0)
+	ui.hideKnown = newButton(inner, "Hide known: OFF", UDim2.new(0, 246, 0, 32), UDim2.new(0, 80, 0, 22), function()
+		hideKnown = not hideKnown
+		ui.hideKnown.Text = hideKnown and "Hide known: ON" or "Hide known: OFF"
+		rowsDirty = true
+	end)
+	ui.hideKnown.TextSize = 10
+
+	ui.list = make("ScrollingFrame", {
+		BorderSizePixel = 1,
+		Position = UDim2.new(0, 6, 0, 58),
+		Size = UDim2.new(0, 320, 1, -64),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 4,
+	}, inner)
+	themeBox(ui.list)
+	ui.list.ScrollBarImageColor3 = Library.AccentColor
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, ui.list)
+	make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingLeft = UDim.new(0, 2) }, ui.list)
+
+	-- Right: details -----------------------------------------------------------
+	local right = make("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 334, 0, 32),
+		Size = UDim2.new(1, -340, 1, -38),
+	}, inner)
+	ui.details = make("TextLabel", {
+		BorderSizePixel = 1,
+		FontFace = FONT,
+		RichText = true,
+		Text = detailText(nil),
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Position = UDim2.new(0, 0, 0, 0),
+		Size = UDim2.new(1, 0, 0, 260),
+	}, right)
+	themeBox(ui.details)
+	themeText(ui.details)
+	make("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 6) }, ui.details)
+
+	local open = newButton(right, "Open In Builder", UDim2.new(0, 0, 0, 268), UDim2.new(0, 170, 0, 28), function()
+		openInBuilder(selected)
+	end)
+	open.BackgroundColor3 = Library.AccentColor
+	open.TextColor3 = Color3.new(0, 0, 0)
+	newButton(right, "Remove", UDim2.new(0, 176, 0, 268), UDim2.new(0, 90, 0, 28), function()
+		if selected then
+			culprits[selected.id] = nil
+			selected = nil
+			saveLog()
+			rowsDirty = true
+			refreshRows()
+		end
+	end)
+	local hint = newLabel(
+		right,
+		"Opens the matching Animation, Sound or Effect builder with this entry loaded, so you can place the actions and save the timing. The log is saved to your workspace folder and kept between sessions.",
+		UDim2.new(0, 0, 0, 304),
+		UDim2.new(1, 0, 0, 70),
+		11
+	)
+	hint.TextWrapped = true
+	hint.TextYAlignment = Enum.TextYAlignment.Top
+
+	Library:MakeDraggable(outer)
+
+	globalConnections[#globalConnections + 1] = RunService.RenderStepped:Connect(function()
+		if not screenGui.Enabled then
+			return
+		end
+		if rowsDirty and os.clock() - lastRowRefresh > 0.4 then
+			lastRowRefresh = os.clock()
+			refreshRows()
+		end
+	end)
+end
+
+function DamageLogger.open()
+	loadLog()
+	if not ui then
+		buildGui()
+	end
+	ui.screenGui.Enabled = true
+	rowsDirty = true
+	refreshRows()
+end
+
+function DamageLogger.close()
+	if ui then
+		ui.screenGui.Enabled = false
+	end
+end
+
+function DamageLogger.init()
+	loadLog()
+end
+
+function DamageLogger.detach()
+	DamageLogger.setEnabled(false)
+	disconnectList(globalConnections)
+	if ui and ui.screenGui then
+		pcall(function()
+			ui.screenGui:Destroy()
+		end)
+	end
+	ui = nil
+end
+
+return DamageLogger
+end)
 __bundle_register("Features/Game/SoundLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
 return require("Features/Game/TimingLogger")("Sound")
 end)
@@ -84579,7 +85641,7 @@ local Workspace = game:GetService("Workspace")
 local loggerEnabled = false
 local detectionRange = 100
 local connections = {}
-local hookedAnimators = {}
+local hookedAnimators = setmetatable({}, { __mode = "k" })
 local lastLogged = setmetatable({}, { __mode = "k" })
 local function disconnectAll()
 for _, connection in ipairs(connections) do
@@ -84637,6 +85699,9 @@ local connection = instance.Played:Connect(function()
 logEvent("Sound", instance, instance.SoundId ~= "" and instance.SoundId or instance.Name)
 end)
 table.insert(connections, connection)
+instance.Destroying:Connect(function()
+pcall(function() connection:Disconnect() end)
+end)
 elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam") or instance:IsA("Highlight") then
 logEvent("Effect", instance, instance.ClassName .. " (" .. instance.Name .. ")")
 end
@@ -84765,6 +85830,40 @@ end,
 })
 groupbox:AddButton("Open Effect Logger", function()
 EffectLogger.open()
+end)
+local DamageLogger = require("Features/Game/DamageLogger")
+groupbox:AddDivider()
+groupbox:AddToggle("DamageLoggerEnabled", {
+Text = "Damage Logger",
+Tooltip = "Whenever you lose health, records the animations, effects and sounds that happened near you just before it, so you can set timings for them later.",
+Default = false,
+Callback = function(value)
+DamageLogger.setEnabled(value)
+end,
+})
+groupbox:AddSlider("DamageLoggerRange", {
+Text = "Damage Logger Range",
+Default = 60,
+Min = 10,
+Max = 300,
+Suffix = " studs",
+Rounding = 0,
+Callback = function(value)
+DamageLogger.setRange(value)
+end,
+})
+groupbox:AddSlider("DamageLoggerMinDamage", {
+Text = "Minimum Damage To Log",
+Default = 3,
+Min = 1,
+Max = 50,
+Rounding = 0,
+Callback = function(value)
+DamageLogger.setMinDamage(value)
+end,
+})
+groupbox:AddButton("Open Damage Log", function()
+DamageLogger.open()
 end)
 end
 function ExploitTab.initLocalCharacterExploitsSection(groupbox)
@@ -84965,6 +86064,13 @@ local key = kind .. "|" .. eventLoggerName(instance) .. "|" .. tostring(extra or
 local now = os.clock()
 local last = EventLogger.Last[key]
 if last and now - last < EventLogger.Cooldown then return end
+if not last then
+EventLogger.LastCount = (EventLogger.LastCount or 0) + 1
+if EventLogger.LastCount > 2000 then
+EventLogger.Last = {}
+EventLogger.LastCount = 1
+end
+end
 EventLogger.Last[key] = now
 print(string.format("[Nearby %s] %.1f studs | %s%s", kind, distance, eventLoggerName(instance), extra and (" | " .. tostring(extra)) or ""))
 end
@@ -84977,6 +86083,13 @@ local animation = track and track.Animation
 local id = animation and animation.AnimationId or "unknown"
 eventLoggerPrint("Animation", animator, "ID=" .. tostring(id))
 end)
+animator.Destroying:Connect(function()
+local existing = EventLogger.AnimatorConnections[animator]
+if existing then
+pcall(function() existing:Disconnect() end)
+EventLogger.AnimatorConnections[animator] = nil
+end
+end)
 end
 
 local function eventLoggerWatchSound(sound)
@@ -84988,6 +86101,13 @@ local id = sound.SoundId
 end
 end)
 EventLogger.SoundConnections[sound] = connection
+sound.Destroying:Connect(function()
+local existing = EventLogger.SoundConnections[sound]
+if existing then
+pcall(function() existing:Disconnect() end)
+EventLogger.SoundConnections[sound] = nil
+end
+end)
 if sound.Playing then
 local id = sound.SoundId
 eventLoggerPrint("Sound", sound, "ID=" .. tostring(id))
