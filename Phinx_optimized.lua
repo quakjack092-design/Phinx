@@ -69527,16 +69527,6 @@ q = true
 shortLen = true
 t(2, "recent-short-stop")
 end
-local replayGap = self._apReplayGaps and self._apReplayGaps[track] or nil
-local replay = false
-if isPlayer and replayGap and replayGap < APB_TUNING.replayGap then
-replay = true
-t(2, "track-replay")
-end
-local hot = isPlayer and self:_apbIsHot(now) or false
-if hot then
-t(2, "flagged-source")
-end
 local shapeSuspicious = lowWeight or badPriority or badSpeed or shortLen or blendGap
 local missing = ownership.status == "missing"
 local confirmedOwn = ownership.status == "confirmed"
@@ -69581,12 +69571,6 @@ local likelyReal = ownedRealistic and not stackedBreaker
 local legitContext = anyReal and not stackedBreaker
 local fakeHard = isPlayer and not legitContext and (Gr or j3 or extremeSpeed or (notPlaying and Or and (shapeSuspicious or breakerSignal)) or (NA and (shapeSuspicious or breakerSignal or not Tt)))
 local fakeStacked = isPlayer and not legitContext and (stackedBreaker or (Or and highSignals and tr >= 7 and (shapeSuspicious or breakerSignal or not Tt or shortCount >= 3)))
-local fakeEscalated = false
-if hot and not zo and not strongReal and not ownedRealOrConfirmed and not n3 and not EA then
-local burstLike = bt or q or replay or shortCount >= 1 or activeSusp >= 2
-local anomalous = j3 or extremeSpeed or notPlaying or badPriority or NA
-fakeEscalated = (burstLike or anomalous) and tr >= 4
-end
 local tier = "Uncertain"
 if not isPlayer then
 tier = "Real"
@@ -69596,14 +69580,14 @@ elseif likelyReal then
 tier = "Likely Real"
 elseif fakeHard then
 tier = "Fake"
-elseif fakeStacked or fakeEscalated then
+elseif fakeHard or fakeStacked then
 tier = "Likely Fake"
 elseif legitContext then
 tier = "Likely Real"
 elseif tr > 0 or Or or q then
 tier = "Suspicious"
 end
-local block = fakeHard or fakeStacked or fakeEscalated
+local block = fakeHard or fakeStacked
 local decision = block and "BlockFakeOccurrence" or ((strongReal or likelyReal or legitContext) and "AllowReal" or "AllowUncertain")
 return {
 block = block,
@@ -69619,9 +69603,6 @@ raw = {
 category = category,
 hasBurstPattern = q,
 breakerTimer = bt,
-trackReplay = replay,
-flaggedSource = hot,
-escalated = fakeEscalated,
 recentGlobal = globalCount,
 plausible = hitPlausible,
 geometricPlausibility = Tt and "plausible" or "none",
@@ -70426,87 +70407,35 @@ end
 self:apcr(child)
 end))
 end
-local APB_TUNING = {
-	evidenceWindow = 1.0,
-	evidenceThreshold = 3,
-	evidenceLongWindow = 3.0,
-	evidenceLongThreshold = 5,
-	flagResetWindow = 10.0,
-	escalationWindow = 4.0,
-	heatHalfLife = 2.0,
-	heatHot = 2.0,
-	heatCap = 8.0,
-	notifyCooldown = 10.0,
-	replayGap = 0.25,
-}
-function AnimatorDefender:_apbHeatNow(now)
-	local heat = self._apbHeat or 0
-	if heat <= 0 then
-		return 0
-	end
-	local dt = now - (self._apbHeatAt or now)
-	if dt > 0 then
-		heat = heat * (0.5 ^ (dt / APB_TUNING.heatHalfLife))
-		if heat < 0.05 then
-			heat = 0
-		end
-	end
-	return heat
+local APB_EVIDENCE_WINDOW = 1.0       local APB_EVIDENCE_THRESHOLD = 3      local APB_FLAG_RESET_WINDOW = 10.0    local APB_NOTIFY_COOLDOWN = 10.0      function AnimatorDefender:_apbEvidenceEvent()
+local now = os.clock()
+local ev = self._apbEvidence
+local writeIdx = 0
+for i = 1, #ev do
+if now - ev[i] <= APB_EVIDENCE_WINDOW then
+writeIdx = writeIdx + 1
+ev[writeIdx] = ev[i]
 end
-function AnimatorDefender:_apbAddHeat(amount, now)
-	local heat = math.min(self:_apbHeatNow(now) + amount, APB_TUNING.heatCap)
-	self._apbHeat = heat
-	self._apbHeatAt = now
-	return heat
 end
--- True while this player is a known breaker (recently flagged / still "hot").
--- Only ever used to scrutinise their *unverified* animations; it never touches timings.
-function AnimatorDefender:_apbIsHot(now)
-	if Configuration.expectToggleValue("AntiBreakerEscalation") == false then
-		return false
-	end
-	if self._apbFlagged and now - (self._apbFlaggedAt or 0) <= APB_TUNING.escalationWindow then
-		return true
-	end
-	return self:_apbHeatNow(now) >= APB_TUNING.heatHot
+for i = #ev, writeIdx + 1, -1 do
+ev[i] = nil
 end
-function AnimatorDefender:_apbEvidenceEvent()
-	local now = os.clock()
-	local ev = self._apbEvidence
-	local writeIdx = 0
-	for i = 1, #ev do
-		if now - ev[i] <= APB_TUNING.evidenceLongWindow then
-			writeIdx = writeIdx + 1
-			ev[writeIdx] = ev[i]
-		end
-	end
-	for i = #ev, writeIdx + 1, -1 do
-		ev[i] = nil
-	end
-	ev[writeIdx + 1] = now
-	local total = writeIdx + 1
-	local recent = 0
-	for i = 1, total do
-		if now - ev[i] <= APB_TUNING.evidenceWindow then
-			recent = recent + 1
-		end
-	end
-	self:_apbAddHeat(1, now)
-	if recent >= APB_TUNING.evidenceThreshold or total >= APB_TUNING.evidenceLongThreshold then
-		self._apbFlagged = true
-		self._apbFlaggedAt = now
-		if Configuration.expectToggleValue("AntiBreakerNotify") then
-			if not self._apbNotifiedAt or (now - self._apbNotifiedAt) > APB_TUNING.notifyCooldown then
-				self._apbNotifiedAt = now
-				local name = self.entity and self.entity.Name or "Someone"
-				pcall(function()
-					Library:Notify(string.format("%s is attempting to AP break you.", name), APB_TUNING.notifyCooldown)
-				end)
-			end
-		end
-	elseif self._apbFlagged and now - (self._apbFlaggedAt or 0) > APB_TUNING.flagResetWindow then
-		self._apbFlagged = false
-	end
+ev[writeIdx + 1] = now
+if writeIdx + 1 >= APB_EVIDENCE_THRESHOLD then
+self._apbFlagged = true
+self._apbFlaggedAt = now
+if Configuration.expectToggleValue("AntiBreakerNotify") then
+if not self._apbNotifiedAt or (now - self._apbNotifiedAt) > APB_NOTIFY_COOLDOWN then
+self._apbNotifiedAt = now
+local name = self.entity and self.entity.Name or "Someone"
+pcall(function()
+Library:Notify(string.format("%s is attempting to AP break you.", name), APB_NOTIFY_COOLDOWN)
+end)
+end
+end
+elseif self._apbFlagged and now - (self._apbFlaggedAt or 0) > APB_FLAG_RESET_WINDOW then
+self._apbFlagged = false
+end
 end
 function AnimatorDefender:apProcess(track, occurrence, timing, recovered)
 if not self.apAdvancedEnabled or not self.apAuthenticator then
@@ -70601,9 +70530,6 @@ end
 if report.block then
 self:_apbEvidenceEvent()
 return
-end
-if (report.score or 0) >= 5 and report.tier ~= "Real" and report.tier ~= "Likely Real" then
-self:_apbAddHeat(0.5, os.clock())
 end
 if not self:pvalidate(track, resolved, report) then
 return
@@ -70737,19 +70663,9 @@ local admitted, admittedTiming, admittedRecovered = self:rlimit(track)
 if not admitted then
 return
 end
-local playedAt = os.clock()
-local lastPlays = self._apLastPlayAt
-if not lastPlays then
-lastPlays = setmetatable({}, { __mode = "k" })
-self._apLastPlayAt = lastPlays
-self._apReplayGaps = setmetatable({}, { __mode = "k" })
-end
-local lastPlay = lastPlays[track]
-self._apReplayGaps[track] = lastPlay and (playedAt - lastPlay) or nil
-lastPlays[track] = playedAt
 local occurrence = (self._apTrackOccurrences[track] or 0) + 1
 self._apTrackOccurrences[track] = occurrence
-self._apOccurrenceStartedAt[track] = { occurrence = occurrence, startedAt = playedAt }
+self._apOccurrenceStartedAt[track] = { occurrence = occurrence, startedAt = os.clock() }
 return self:apProcess(track, occurrence, admittedTiming, admittedRecovered)
 end
 self._evaluationData[track] = { t = tick() }
@@ -70974,10 +70890,6 @@ self._apCriticalConfirmedSources = {}
 self._apStampTrack = nil
 self._apStampOccurrence = nil
 self._apbEvidence = {}
-self._apbHeat = 0
-self._apbHeatAt = nil
-self._apLastPlayAt = nil
-self._apReplayGaps = nil
 self._apbFlagged = false
 self._apbFlaggedAt = nil
 self._apbNotifiedAt = nil
@@ -87020,11 +86932,6 @@ autoDefenseDepBox:AddToggle("CancelOnTradeWin", {
 Text = "Cancel On Trade Win",
 Default = true,
 Tooltip = "When you hit an enemy during their attack before they hit you, their pending parry/dodge timings are cancelled. Hyper-armor moves are ignored.",
-})
-autoDefenseDepBox:AddToggle("AntiBreakerEscalation", {
-Text = "Anti-Breaker Escalation",
-Default = true,
-Tooltip = "After a player is caught breaking, their unverified burst-pattern animations are blocked more strictly for a few seconds. Verified real attacks and your AP timings are never affected.",
 })
 local blatantRollToggle = autoDefenseDepBox:AddToggle("BlatantRoll", {
 Text = "Blatant Roll",
