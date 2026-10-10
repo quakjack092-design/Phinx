@@ -2861,11 +2861,11 @@ Registry = {},
 RegistryMap = {},
 OverrideData = {},
 HudRegistry = {},
-FontColor = Color3.fromRGB(235, 235, 245),
-MainColor = Color3.fromRGB(24, 24, 28),
-BackgroundColor = Color3.fromRGB(15, 15, 18),
-AccentColor = Color3.fromRGB(151, 125, 224),
-OutlineColor = Color3.fromRGB(63, 60, 75),
+FontColor = Color3.fromRGB(240, 240, 240),
+MainColor = Color3.fromRGB(41, 41, 41),
+BackgroundColor = Color3.fromRGB(36, 36, 36),
+AccentColor = Color3.fromRGB(102, 57, 140),
+OutlineColor = Color3.fromRGB(20, 20, 20),
 RiskColor = Color3.fromRGB(255, 50, 50),
 Black = Color3.new(0, 0, 0),
 Font = Font.fromEnum(Enum.Font.Code),
@@ -2875,6 +2875,15 @@ SearchIndex = {},
 Signals = {},
 ScreenGui = ScreenGui,
 }
+function Library.GetTabActiveColor()
+return Library.MainColor:Lerp(Color3.new(1, 1, 1), 0.05)
+end
+function Library.GetTabInactiveColor()
+return Library.BackgroundColor:Lerp(Color3.new(0, 0, 0), 0.18)
+end
+function Library.GetTabInactiveText()
+return Library.FontColor:Lerp(Library.BackgroundColor, 0.4)
+end
 local RainbowStep = 0
 local Hue = 0
 local RainbowColorPickers = {}
@@ -3580,7 +3589,7 @@ Parent = HueBoxOuter,
 Library:Create("UIGradient", {
 Color = ColorSequence.new({
 ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212)),
+ColorSequenceKeypoint.new(1, Color3.fromRGB(236, 236, 236)),
 }),
 Rotation = 90,
 Parent = HueBoxInner,
@@ -4411,7 +4420,7 @@ Parent = Inner,
 Library:Create("UIGradient", {
 Color = ColorSequence.new({
 ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212)),
+ColorSequenceKeypoint.new(1, Color3.fromRGB(236, 236, 236)),
 }),
 Rotation = 90,
 Parent = Inner,
@@ -4599,7 +4608,7 @@ end
 Library:Create("UIGradient", {
 Color = ColorSequence.new({
 ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212)),
+ColorSequenceKeypoint.new(1, Color3.fromRGB(236, 236, 236)),
 }),
 Rotation = 90,
 Parent = TextBoxInner,
@@ -4964,7 +4973,7 @@ DisplayLabel.Text = Info.Text .. ": " .. Slider.Value .. Suffix
 elseif Info.HideMax then
 DisplayLabel.Text = string.format("%s", Slider.Value .. Suffix)
 else
-DisplayLabel.Text = string.format("%s/%s", Slider.Value .. Suffix, Slider.Max .. Suffix)
+DisplayLabel.Text = string.format("%s", Slider.Value .. Suffix)
 end
 local X = math.ceil(Library:MapValue(Slider.Value, Slider.Min, Slider.Max, 0, Slider.MaxSize))
 Fill.Size = UDim2.new(0, X, 1, 0)
@@ -5138,26 +5147,20 @@ Library:AddToRegistry(DropdownInner, {
 BackgroundColor3 = "MainColor",
 BorderColor3 = "OutlineColor",
 })
-Library:Create("UIGradient", {
-Color = ColorSequence.new({
-ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-ColorSequenceKeypoint.new(1, Color3.fromRGB(212, 212, 212)),
-}),
-Rotation = 90,
-Parent = DropdownInner,
-})
-local DropdownArrow = Library:Create("ImageLabel", {
-AnchorPoint = Vector2.new(0, 0.5),
-BackgroundTransparency = 1,
-Position = UDim2.new(1, -16, 0.5, 0),
-Size = UDim2.new(0, 12, 0, 12),
-Image = "http://www.roblox.com/asset/?id=6282522798",
+local DropdownArrow = Library:CreateLabel({
+AnchorPoint = Vector2.new(1, 0.5),
+Position = UDim2.new(1, -6, 0.5, 0),
+Size = UDim2.new(0, 24, 0, 14),
+Text = Info.Multi and "..." or "-",
+TextSize = 13,
+TextXAlignment = Enum.TextXAlignment.Right,
+TextYAlignment = Enum.TextYAlignment.Center,
 ZIndex = 8,
 Parent = DropdownInner,
 })
 local ItemList = Library:CreateLabel({
 Position = UDim2.new(0, 5, 0, 0),
-Size = UDim2.new(1, -5, 1, 0),
+Size = UDim2.new(1, -30, 1, 0),
 TextSize = 14,
 Text = "--",
 TextXAlignment = Enum.TextXAlignment.Left,
@@ -6262,7 +6265,7 @@ end
 end))
 local Inner = Library:Create("Frame", {
 BackgroundColor3 = Library.MainColor,
-BorderColor3 = Library.AccentColor,
+BorderColor3 = Library.OutlineColor,
 BorderMode = Enum.BorderMode.Inset,
 Position = UDim2.new(0, 1, 0, 1),
 Size = UDim2.new(1, -2, 1, -2),
@@ -6271,19 +6274,30 @@ Parent = Outer,
 })
 Library:AddToRegistry(Inner, {
 BackgroundColor3 = "MainColor",
-BorderColor3 = "AccentColor",
+BorderColor3 = "OutlineColor",
+})
+local WindowTopLine = Library:Create("Frame", {
+BackgroundColor3 = Library.AccentColor,
+BorderSizePixel = 0,
+Position = UDim2.new(0, 0, 0, 0),
+Size = UDim2.new(1, 0, 0, 2),
+ZIndex = 3,
+Parent = Inner,
+})
+Library:AddToRegistry(WindowTopLine, {
+BackgroundColor3 = "AccentColor",
 })
 local WindowLabel = Library:CreateLabel({
-Position = UDim2.new(0, 8, 0, 0),
-Size = UDim2.new(0, 0, 0, 25),
+Position = UDim2.new(0, 8, 0, 1),
+Size = UDim2.new(0, 0, 0, 24),
 Text = Config.Title or "",
-TextColor3 = Library.AccentColor,
+TextColor3 = Library.FontColor,
 TextXAlignment = Enum.TextXAlignment.Left,
 ZIndex = 1,
 Parent = Inner,
 })
 Library:AddToRegistry(WindowLabel, {
-TextColor3 = "AccentColor",
+TextColor3 = "FontColor",
 })
 do
 local SearchOuter = Library:Create("Frame", {
@@ -6571,6 +6585,19 @@ Parent = Sidebar,
 SidebarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
 Sidebar.CanvasSize = UDim2.fromOffset(SidebarLayout.AbsoluteContentSize.X, 0)
 end)
+Window.TabButtons = {}
+local function LayoutTabs()
+local Count = #Window.TabButtons
+local Total = Sidebar.AbsoluteSize.X
+if Count == 0 or Total <= 0 then
+return
+end
+local Width = math.floor((Total - Config.TabPadding * (Count - 1)) / Count)
+for _, Button in ipairs(Window.TabButtons) do
+Button.Size = UDim2.new(0, Width, 1, 0)
+end
+end
+Sidebar:GetPropertyChangedSignal("AbsoluteSize"):Connect(LayoutTabs)
 local TabContainer = Library:Create("Frame", {
 BackgroundColor3 = Library.MainColor,
 BorderColor3 = Library.OutlineColor,
@@ -6595,49 +6622,35 @@ Groupboxes = {},
 Tabboxes = {},
 }
 Window.NextLayoutOrder = Window.NextLayoutOrder + 1
+local TabActive = false
 local TabButton = Library:Create("Frame", {
-BackgroundColor3 = Library.BackgroundColor,
-BorderColor3 = Library.OutlineColor,
-Size = UDim2.new(0, 104, 1, 0),
+BackgroundColor3 = Library.GetTabInactiveColor(),
+BorderColor3 = Color3.new(0, 0, 0),
+Size = UDim2.new(0, 80, 1, 0),
 LayoutOrder = Window.NextLayoutOrder,
 ZIndex = 2,
 Parent = Sidebar,
 })
 Library:AddToRegistry(TabButton, {
-BackgroundColor3 = "BackgroundColor",
-BorderColor3 = "OutlineColor",
+BackgroundColor3 = Library.GetTabInactiveColor,
+BorderColor3 = "Black",
 })
-local TabGlyphs = {
-Combat = "⚔",
-Game = "◆",
-Visuals = "◉",
-Auto = "▶",
-Exploit = "◇",
-Settings = "⚙",
-}
-local TabButtonIcon = Library:CreateLabel({
-Position = UDim2.new(0, 6, 0, 0),
-Size = UDim2.new(0, 20, 1, 0),
-Text = TabGlyphs[Name] or "•",
-TextColor3 = Library.FontColor,
-TextSize = 15,
+local TabButtonLabel = Library:CreateLabel({
+Position = UDim2.new(0, 0, 0, 0),
+Size = UDim2.new(1, 0, 1, 0),
+Text = Name,
+TextSize = 13,
+TextColor3 = Library.GetTabInactiveText(),
 TextXAlignment = Enum.TextXAlignment.Center,
 TextYAlignment = Enum.TextYAlignment.Center,
 ZIndex = 3,
 Parent = TabButton,
 })
-Library:AddToRegistry(TabButtonIcon, {
-TextColor3 = "FontColor",
-})
-local TabButtonLabel = Library:CreateLabel({
-Position = UDim2.new(0, 27, 0, 0),
-Size = UDim2.new(1, -30, 1, 0),
-Text = Name,
-TextSize = 13,
-TextXAlignment = Enum.TextXAlignment.Left,
-ZIndex = 3,
-Parent = TabButton,
-})
+Library.RegistryMap[TabButtonLabel].Properties.TextColor3 = function()
+return TabActive and Library.FontColor or Library.GetTabInactiveText()
+end
+table.insert(Window.TabButtons, TabButton)
+LayoutTabs()
 local TabFrame = Library:Create("Frame", {
 Name = "TabFrame",
 BackgroundTransparency = 1,
@@ -6694,13 +6707,17 @@ function Tab:ShowTab()
 for _, Tab in next, Window.Tabs do
 Tab:HideTab()
 end
-TabButton.BackgroundColor3 = Library.AccentColorDark
-Library.RegistryMap[TabButton].Properties.BackgroundColor3 = "AccentColorDark"
+TabActive = true
+TabButton.BackgroundColor3 = Library.GetTabActiveColor()
+Library.RegistryMap[TabButton].Properties.BackgroundColor3 = Library.GetTabActiveColor
+TabButtonLabel.TextColor3 = Library.FontColor
 TabFrame.Visible = true
 end
 function Tab:HideTab()
-TabButton.BackgroundColor3 = Library.BackgroundColor
-Library.RegistryMap[TabButton].Properties.BackgroundColor3 = "BackgroundColor"
+TabActive = false
+TabButton.BackgroundColor3 = Library.GetTabInactiveColor()
+Library.RegistryMap[TabButton].Properties.BackgroundColor3 = Library.GetTabInactiveColor
+TabButtonLabel.TextColor3 = Library.GetTabInactiveText()
 TabFrame.Visible = false
 end
 function Tab:SetLayoutOrder(Position)
@@ -6735,7 +6752,7 @@ BackgroundColor3 = "BackgroundColor",
 local Highlight = Library:Create("Frame", {
 BackgroundColor3 = Library.AccentColor,
 BorderSizePixel = 0,
-Size = UDim2.new(1, 0, 0, 1),
+Size = UDim2.new(1, 0, 0, 2),
 ZIndex = 5,
 Parent = BoxInner,
 })
@@ -6744,7 +6761,7 @@ BackgroundColor3 = "AccentColor",
 })
 local GroupboxLabel = Library:CreateLabel({
 Size = UDim2.new(1, 0, 0, 18),
-Position = UDim2.new(0, 4, 0, 2),
+Position = UDim2.new(0, 6, 0, 2),
 TextSize = 12,
 Text = Info.Name,
 TextXAlignment = Enum.TextXAlignment.Left,
@@ -6824,7 +6841,7 @@ BackgroundColor3 = "BackgroundColor",
 local Highlight = Library:Create("Frame", {
 BackgroundColor3 = Library.AccentColor,
 BorderSizePixel = 0,
-Size = UDim2.new(1, 0, 0, 1),
+Size = UDim2.new(1, 0, 0, 2),
 ZIndex = 10,
 Parent = BoxInner,
 })
@@ -6833,7 +6850,7 @@ BackgroundColor3 = "AccentColor",
 })
 local TabboxButtons = Library:Create("Frame", {
 BackgroundTransparency = 1,
-Position = UDim2.new(0, 0, 0, 1),
+Position = UDim2.new(0, 0, 0, 2),
 Size = UDim2.new(1, 0, 0, 18),
 ZIndex = 5,
 Parent = BoxInner,
@@ -8704,8 +8721,16 @@ local taskFunction = Profiler.wrap(
 label,
 LPH_NO_VIRTUALIZE(function(...)
 local timestamp = os.clock()
+local consistency = Toggles and Toggles.ParryConsistency
+if consistency and consistency.Value then
+local frame = 1 / 60
+while delay() - (os.clock() - timestamp) > frame * 0.5 do
+frame = math.clamp(RunService.RenderStepped:Wait(), 1 / 240, 1 / 20)
+end
+else
 while os.clock() - timestamp < delay() do
 RunService.RenderStepped:Wait()
+end
 end
 return xpcall(callback, onTaskFunctionError, ...)
 end)
@@ -16918,7 +16943,7 @@ end
 function Latency.sdelay()
 return math.max(Latency.rtt() / 2, 0.0)
 end
-function Latency.rtt()
+local function legacyRtt()
 local raw = rawRtt()
 if not raw then
 return smoothedRtt
@@ -16934,6 +16959,52 @@ deviation = maxJump * (deviation < 0 and -1 or 1)
 end
 smoothedRtt = smoothedRtt + EMA_ALPHA * deviation
 return smoothedRtt
+end
+local STABLE_INTERVAL = 0.1
+local STABLE_WINDOW = 7
+local STABLE_ALPHA = 0.15
+local stableSamples = {}
+local stableRtt = nil
+local stableLastUpdate = 0
+local stableLastRaw = nil
+local stableLastAppend = 0
+local function stableMedian()
+local copy = table.clone(stableSamples)
+table.sort(copy)
+return copy[math.ceil(#copy / 2)]
+end
+local function stableRefresh()
+local now = os.clock()
+if stableRtt and now - stableLastUpdate < STABLE_INTERVAL then
+return
+end
+stableLastUpdate = now
+local raw = rawRtt()
+if not raw then
+return
+end
+if raw ~= stableLastRaw or now - stableLastAppend > 1.5 then
+stableLastRaw = raw
+stableLastAppend = now
+stableSamples[#stableSamples + 1] = raw
+if #stableSamples > STABLE_WINDOW then
+table.remove(stableSamples, 1)
+end
+end
+local median = stableMedian()
+if not stableRtt then
+stableRtt = median
+else
+stableRtt = stableRtt + STABLE_ALPHA * (median - stableRtt)
+end
+end
+function Latency.rtt()
+local toggle = Toggles and Toggles.ParryConsistency
+if toggle and toggle.Value then
+stableRefresh()
+return stableRtt or 0
+end
+return legacyRtt()
 end
 return Latency
 end)
@@ -66547,6 +66618,9 @@ self.uids = self.uids + spaces
 return self.uids
 end
 Defender.visualize = LPH_NO_VIRTUALIZE(function(self, identifier, cframe, size, color, shape)
+if not Configuration.expectToggleValue("EnableVisualizations") then
+return
+end
 local id = identifier or self:uid(10)
 local vpart = self.hmaid[id] or Instance.new("Part")
 pcall(function()
@@ -66601,6 +66675,7 @@ if shape == Enum.PartType.Cylinder then
 simulationPart.CFrame = usedCFrame * CFrame.Angles(0, 0, math.rad(90))
 end
 local parts = workspace:GetPartsInPart(simulationPart, overlapParams)
+simulationPart:Destroy()
 return shouldManualFilter and checkParts(parts, filter) or #parts > 0, usedCFrame
 end)
 Defender.approachRange = LPH_NO_VIRTUALIZE(function()
@@ -68354,7 +68429,7 @@ local startedAt = os.clock()
 local deadline = startedAt + graceMs / 1000
 hoptions.hmid = self:uid(10)
 while os.clock() < deadline do
-task.wait()
+task.wait(0.025)
 if self.track ~= watchedTrack or not self.entity or not root.Parent then
 break
 end
@@ -79851,7 +79926,7 @@ local window = Library:CreateWindow({
 Title = MENU_TITLE,
 Center = true,
 AutoShow = not shared.Lycoris.silent,
-TabPadding = 3,
+TabPadding = 0,
 MenuFadeTime = 0.0,
 Size = UDim2.fromOffset(560, 570),
 })
@@ -81167,7 +81242,7 @@ ThemeManager.BuiltInThemes = {
 ["Default"] = {
 1,
 httpService:JSONDecode(
-'{"FontColor":"ffffff","MainColor":"1c1c1c","AccentColor":"0055ff","BackgroundColor":"141414","OutlineColor":"323232"}'
+'{"FontColor":"f0f0f0","MainColor":"292929","AccentColor":"66398c","BackgroundColor":"242424","OutlineColor":"141414"}'
 ),
 },
 ["BBot"] = {
@@ -86043,6 +86118,11 @@ expApBreakerDepBox:SetupDependencies({
 })
 end
 function CombatTab.initDynamicHitboxSection(groupbox)
+groupbox:AddToggle("ParryConsistency", {
+Text = "Consistent Timing",
+Default = true,
+Tooltip = "Smooths your ping reading over time and fires each action on the nearest frame instead of always the next one. Turn off to use the old timing.",
+})
 groupbox:AddToggle("DynamicHitbox", {
 Text = "Dynamic Hitbox",
 Default = true,
@@ -86070,7 +86150,7 @@ end
 function CombatTab.init(window)
 local tab = window:AddTab("Combat", "Combat", Icons.Combat)
 CombatTab.initAutoDefenseSection(tab:AddDynamicGroupbox("Auto Defense"))
-CombatTab.initDynamicHitboxSection(tab:AddDynamicGroupbox("Dynamic Hitbox"))
+CombatTab.initDynamicHitboxSection(tab:AddDynamicGroupbox("Timing & Hitbox"))
 local tabbox = tab:AddDynamicTabbox()
 CombatTab.initCombatTargetingSection(tabbox:AddTab("Targeting"))
 CombatTab.initCombatWhitelistSection(tabbox:AddTab("Whitelisting"))
