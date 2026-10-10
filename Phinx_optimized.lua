@@ -69527,6 +69527,16 @@ q = true
 shortLen = true
 t(2, "recent-short-stop")
 end
+local replayGap = self._apReplayGaps and self._apReplayGaps[track] or nil
+local replay = false
+if isPlayer and replayGap and replayGap < APB_TUNING.replayGap then
+replay = true
+t(2, "track-replay")
+end
+local hot = isPlayer and self:_apbIsHot(now) or false
+if hot then
+t(2, "flagged-source")
+end
 local shapeSuspicious = lowWeight or badPriority or badSpeed or shortLen or blendGap
 local missing = ownership.status == "missing"
 local confirmedOwn = ownership.status == "confirmed"
@@ -69571,6 +69581,12 @@ local likelyReal = ownedRealistic and not stackedBreaker
 local legitContext = anyReal and not stackedBreaker
 local fakeHard = isPlayer and not legitContext and (Gr or j3 or extremeSpeed or (notPlaying and Or and (shapeSuspicious or breakerSignal)) or (NA and (shapeSuspicious or breakerSignal or not Tt)))
 local fakeStacked = isPlayer and not legitContext and (stackedBreaker or (Or and highSignals and tr >= 7 and (shapeSuspicious or breakerSignal or not Tt or shortCount >= 3)))
+local fakeEscalated = false
+if hot and not zo and not strongReal and not ownedRealOrConfirmed and not n3 and not EA then
+local burstLike = bt or q or replay or shortCount >= 1 or activeSusp >= 2
+local anomalous = j3 or extremeSpeed or notPlaying or badPriority or NA
+fakeEscalated = (burstLike or anomalous) and tr >= 4
+end
 local tier = "Uncertain"
 if not isPlayer then
 tier = "Real"
@@ -69580,14 +69596,14 @@ elseif likelyReal then
 tier = "Likely Real"
 elseif fakeHard then
 tier = "Fake"
-elseif fakeHard or fakeStacked then
+elseif fakeStacked or fakeEscalated then
 tier = "Likely Fake"
 elseif legitContext then
 tier = "Likely Real"
 elseif tr > 0 or Or or q then
 tier = "Suspicious"
 end
-local block = fakeHard or fakeStacked
+local block = fakeHard or fakeStacked or fakeEscalated
 local decision = block and "BlockFakeOccurrence" or ((strongReal or likelyReal or legitContext) and "AllowReal" or "AllowUncertain")
 return {
 block = block,
@@ -69603,6 +69619,9 @@ raw = {
 category = category,
 hasBurstPattern = q,
 breakerTimer = bt,
+trackReplay = replay,
+flaggedSource = hot,
+escalated = fakeEscalated,
 recentGlobal = globalCount,
 plausible = hitPlausible,
 geometricPlausibility = Tt and "plausible" or "none",
@@ -70407,35 +70426,87 @@ end
 self:apcr(child)
 end))
 end
-local APB_EVIDENCE_WINDOW = 1.0       local APB_EVIDENCE_THRESHOLD = 3      local APB_FLAG_RESET_WINDOW = 10.0    local APB_NOTIFY_COOLDOWN = 10.0      function AnimatorDefender:_apbEvidenceEvent()
-local now = os.clock()
-local ev = self._apbEvidence
-local writeIdx = 0
-for i = 1, #ev do
-if now - ev[i] <= APB_EVIDENCE_WINDOW then
-writeIdx = writeIdx + 1
-ev[writeIdx] = ev[i]
+local APB_TUNING = {
+	evidenceWindow = 1.0,
+	evidenceThreshold = 3,
+	evidenceLongWindow = 3.0,
+	evidenceLongThreshold = 5,
+	flagResetWindow = 10.0,
+	escalationWindow = 4.0,
+	heatHalfLife = 2.0,
+	heatHot = 2.0,
+	heatCap = 8.0,
+	notifyCooldown = 10.0,
+	replayGap = 0.25,
+}
+function AnimatorDefender:_apbHeatNow(now)
+	local heat = self._apbHeat or 0
+	if heat <= 0 then
+		return 0
+	end
+	local dt = now - (self._apbHeatAt or now)
+	if dt > 0 then
+		heat = heat * (0.5 ^ (dt / APB_TUNING.heatHalfLife))
+		if heat < 0.05 then
+			heat = 0
+		end
+	end
+	return heat
 end
+function AnimatorDefender:_apbAddHeat(amount, now)
+	local heat = math.min(self:_apbHeatNow(now) + amount, APB_TUNING.heatCap)
+	self._apbHeat = heat
+	self._apbHeatAt = now
+	return heat
 end
-for i = #ev, writeIdx + 1, -1 do
-ev[i] = nil
+-- True while this player is a known breaker (recently flagged / still "hot").
+-- Only ever used to scrutinise their *unverified* animations; it never touches timings.
+function AnimatorDefender:_apbIsHot(now)
+	if Configuration.expectToggleValue("AntiBreakerEscalation") == false then
+		return false
+	end
+	if self._apbFlagged and now - (self._apbFlaggedAt or 0) <= APB_TUNING.escalationWindow then
+		return true
+	end
+	return self:_apbHeatNow(now) >= APB_TUNING.heatHot
 end
-ev[writeIdx + 1] = now
-if writeIdx + 1 >= APB_EVIDENCE_THRESHOLD then
-self._apbFlagged = true
-self._apbFlaggedAt = now
-if Configuration.expectToggleValue("AntiBreakerNotify") then
-if not self._apbNotifiedAt or (now - self._apbNotifiedAt) > APB_NOTIFY_COOLDOWN then
-self._apbNotifiedAt = now
-local name = self.entity and self.entity.Name or "Someone"
-pcall(function()
-Library:Notify(string.format("%s is attempting to AP break you.", name), APB_NOTIFY_COOLDOWN)
-end)
-end
-end
-elseif self._apbFlagged and now - (self._apbFlaggedAt or 0) > APB_FLAG_RESET_WINDOW then
-self._apbFlagged = false
-end
+function AnimatorDefender:_apbEvidenceEvent()
+	local now = os.clock()
+	local ev = self._apbEvidence
+	local writeIdx = 0
+	for i = 1, #ev do
+		if now - ev[i] <= APB_TUNING.evidenceLongWindow then
+			writeIdx = writeIdx + 1
+			ev[writeIdx] = ev[i]
+		end
+	end
+	for i = #ev, writeIdx + 1, -1 do
+		ev[i] = nil
+	end
+	ev[writeIdx + 1] = now
+	local total = writeIdx + 1
+	local recent = 0
+	for i = 1, total do
+		if now - ev[i] <= APB_TUNING.evidenceWindow then
+			recent = recent + 1
+		end
+	end
+	self:_apbAddHeat(1, now)
+	if recent >= APB_TUNING.evidenceThreshold or total >= APB_TUNING.evidenceLongThreshold then
+		self._apbFlagged = true
+		self._apbFlaggedAt = now
+		if Configuration.expectToggleValue("AntiBreakerNotify") then
+			if not self._apbNotifiedAt or (now - self._apbNotifiedAt) > APB_TUNING.notifyCooldown then
+				self._apbNotifiedAt = now
+				local name = self.entity and self.entity.Name or "Someone"
+				pcall(function()
+					Library:Notify(string.format("%s is attempting to AP break you.", name), APB_TUNING.notifyCooldown)
+				end)
+			end
+		end
+	elseif self._apbFlagged and now - (self._apbFlaggedAt or 0) > APB_TUNING.flagResetWindow then
+		self._apbFlagged = false
+	end
 end
 function AnimatorDefender:apProcess(track, occurrence, timing, recovered)
 if not self.apAdvancedEnabled or not self.apAuthenticator then
@@ -70531,6 +70602,9 @@ if report.block then
 self:_apbEvidenceEvent()
 return
 end
+if (report.score or 0) >= 5 and report.tier ~= "Real" and report.tier ~= "Likely Real" then
+self:_apbAddHeat(0.5, os.clock())
+end
 if not self:pvalidate(track, resolved, report) then
 return
 end
@@ -70624,6 +70698,7 @@ return
 end
 local id = self:uid(1)
 self.hits[id] = true
+self:_apTradeWon()
 task.delay(0.2, function()
 self.hits[id] = nil
 end)
@@ -70662,9 +70737,19 @@ local admitted, admittedTiming, admittedRecovered = self:rlimit(track)
 if not admitted then
 return
 end
+local playedAt = os.clock()
+local lastPlays = self._apLastPlayAt
+if not lastPlays then
+lastPlays = setmetatable({}, { __mode = "k" })
+self._apLastPlayAt = lastPlays
+self._apReplayGaps = setmetatable({}, { __mode = "k" })
+end
+local lastPlay = lastPlays[track]
+self._apReplayGaps[track] = lastPlay and (playedAt - lastPlay) or nil
+lastPlays[track] = playedAt
 local occurrence = (self._apTrackOccurrences[track] or 0) + 1
 self._apTrackOccurrences[track] = occurrence
-self._apOccurrenceStartedAt[track] = { occurrence = occurrence, startedAt = os.clock() }
+self._apOccurrenceStartedAt[track] = { occurrence = occurrence, startedAt = playedAt }
 return self:apProcess(track, occurrence, admittedTiming, admittedRecovered)
 end
 self._evaluationData[track] = { t = tick() }
@@ -70734,6 +70819,62 @@ local info = RepeatInfo.new(timing, Latency.rdelay(), self:uid(10))
 info.track = track
 self:srpue(self.entity, timing, info)
 end)
+local TRADE_LOCAL_DAMAGE_WINDOW = 0.3
+local TRADE_MAX_DISTANCE = 30
+local tradeLocal = { humanoid = nil, conn = nil, lastHealth = 0, damagedAt = -math.huge }
+local function localDamagedRecently(window)
+	local character = players.LocalPlayer and players.LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid ~= tradeLocal.humanoid then
+		if tradeLocal.conn then
+			pcall(function()
+				tradeLocal.conn:Disconnect()
+			end)
+			tradeLocal.conn = nil
+		end
+		tradeLocal.humanoid = humanoid
+		if humanoid then
+			tradeLocal.lastHealth = humanoid.Health
+			tradeLocal.conn = humanoid.HealthChanged:Connect(function(health)
+				if health < tradeLocal.lastHealth then
+					tradeLocal.damagedAt = os.clock()
+				end
+				tradeLocal.lastHealth = health
+			end)
+		end
+	end
+	return os.clock() - tradeLocal.damagedAt <= window
+end
+-- You landed a hit on this entity while one of its attacks was still running and
+-- you have not been hit yourself: you won the trade, so drop the pending parry/dodge.
+function AnimatorDefender:_apTradeWon()
+	if Configuration.expectToggleValue("CancelOnTradeWin") == false then
+		return
+	end
+	if not self.track or not self.timing then
+		return
+	end
+	local localPlayer = players.LocalPlayer
+	if self._playerOwner == localPlayer or (localPlayer.Character and self.entity == localPlayer.Character) then
+		return
+	end
+	-- Hyper armor (and criticals) are not interrupted by being hit, so keep defending those.
+	if self.timing.ha then
+		return
+	end
+	local distance = self:distance(self.entity)
+	if not distance or distance > TRADE_MAX_DISTANCE then
+		return
+	end
+	if localDamagedRecently(TRADE_LOCAL_DAMAGE_WINDOW) then
+		return
+	end
+	Logger.warn("(%s) Trade won; cancelling running actions for '%s'.", self.entity.Name, self.timing.name or "?")
+	self._feintedTrack = self.track
+	self:clean()
+	QueuedBlocking.stop("Defender_Deflect")
+	QueuedBlocking.stop("Defender_BlockFallback")
+end
 function AnimatorDefender:_cancelFeintedTrack(reason, expectedTrack)
 if
 not self.track
@@ -70833,6 +70974,10 @@ self._apCriticalConfirmedSources = {}
 self._apStampTrack = nil
 self._apStampOccurrence = nil
 self._apbEvidence = {}
+self._apbHeat = 0
+self._apbHeatAt = nil
+self._apLastPlayAt = nil
+self._apReplayGaps = nil
 self._apbFlagged = false
 self._apbFlaggedAt = nil
 self._apbNotifiedAt = nil
@@ -70871,6 +71016,7 @@ return
 end
 local id = self:uid(1)
 self.hits[id] = true
+self:_apTradeWon()
 task.delay(0.2, function()
 self.hits[id] = nil
 end)
@@ -72460,6 +72606,8 @@ local Defense = require("Features/Combat/Defense")
 local ExpApBreaker = require("Features/Combat/ExpApBreaker")
 local AnimationVisualizer = require("Features/Game/AnimationVisualizer")
 local AnimationLogger = require("Features/Game/AnimationLogger")
+local SoundLogger = require("Features/Game/SoundLogger")
+local EffectLogger = require("Features/Game/EffectLogger")
 local FishFarm = require("Features/Automation/FishFarm")
 local Teleport = require("Features/Game/Teleport")
 local AutoLoot = require("Features/Automation/AutoLoot")
@@ -72495,6 +72643,8 @@ end
 end
 function Features.detach()
 AnimationLogger.detach()
+SoundLogger.detach()
+EffectLogger.detach()
 if not armorshield or armorshield.current_role == "builder" then
 AnimationVisualizer.detach()
 end
@@ -82957,6 +83107,1548 @@ end
 
 return AnimationLogger
 end)
+__bundle_register("Features/Game/TimingLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- Shared implementation for the Sound Logger and the Effect Logger.
+-- It mirrors the Animation Logger: capture what happens near you, scrub a timeline,
+-- drop actions on it, and save the result straight into your timing config.
+local Library = require("GUI/Library")
+local CoreGuiManager = require("Utility/CoreGuiManager")
+local SaveManager = require("Game/Timings/SaveManager")
+local SoundTiming = require("Game/Timings/SoundTiming")
+local EffectTiming = require("Game/Timings/EffectTiming")
+local Action = require("Game/Timings/Action")
+local Logger = require("Utility/Logger")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SoundService = game:GetService("SoundService")
+
+---------------------------------------------------------------------------
+-- Constants
+---------------------------------------------------------------------------
+local MAX_ENTRIES = 250
+-- Same file the Animation Logger writes to, so all of your logged timings live in one config.
+local DEFAULT_SAVE_NAME = "AnimationLogger"
+local FONT = Font.new("rbxasset://fonts/families/RobotoMono.json")
+local TAGS = { "Undefined", "M1", "Mantra", "Critical" }
+local PALETTE = { "Parry", "Dodge", "Forced Full Dodge", "Start Block", "End Block", "Jump" }
+local PALETTE_LABELS = { "Parry", "Dodge", "Full Dodge", "Start Block", "End Block", "Jump" }
+local EFFECT_SOURCES = { "ClientEffect", "ClientEffectLarge", "ClientEffectDirect" }
+local ACTION_COLORS = {
+	["Parry"] = Color3.fromRGB(95, 208, 104),
+	["Dodge"] = Color3.fromRGB(80, 160, 255),
+	["Forced Full Dodge"] = Color3.fromRGB(175, 110, 255),
+	["Start Block"] = Color3.fromRGB(255, 170, 60),
+	["End Block"] = Color3.fromRGB(255, 95, 80),
+	["Jump"] = Color3.fromRGB(240, 225, 90),
+}
+
+---------------------------------------------------------------------------
+-- Stateless helpers
+---------------------------------------------------------------------------
+local function esc(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function notify(fmt, ...)
+	pcall(Logger.notify, fmt, ...)
+end
+
+local function getRoot(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function localRootPart()
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	return character and character:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function distanceToPart(part)
+	if not part then
+		return nil
+	end
+	local localRoot = localRootPart()
+	if not localRoot then
+		return 0
+	end
+	return (part.Position - localRoot.Position).Magnitude
+end
+
+local function parseVector(text, fallback)
+	local nums = {}
+	for token in tostring(text):gmatch("%-?%d*%.?%d+") do
+		nums[#nums + 1] = tonumber(token)
+	end
+	if #nums >= 3 then
+		return Vector3.new(nums[1], nums[2], nums[3])
+	end
+	if #nums == 1 then
+		return Vector3.new(nums[1], nums[1], nums[1])
+	end
+	return fallback
+end
+
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function themeBox(inst, bgKey)
+	bgKey = bgKey or "MainColor"
+	inst.BackgroundColor3 = Library[bgKey]
+	inst.BorderColor3 = Library.OutlineColor
+	Library:AddToRegistry(inst, { BackgroundColor3 = bgKey, BorderColor3 = "OutlineColor" }, true)
+end
+
+local function themeText(inst, key)
+	key = key or "FontColor"
+	inst.TextColor3 = Library[key]
+	Library:AddToRegistry(inst, { TextColor3 = key }, true)
+end
+
+local function newLabel(parent, text, pos, size, textSize, colorKey)
+	local label = make("TextLabel", {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		FontFace = FONT,
+		Text = text,
+		TextSize = textSize or 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeText(label, colorKey)
+	return label
+end
+
+local function newButton(parent, text, pos, size, callback)
+	local button = make("TextButton", {
+		FontFace = FONT,
+		Text = text,
+		TextSize = 12,
+		AutoButtonColor = true,
+		BorderSizePixel = 1,
+		Position = pos,
+		Size = size,
+	}, parent)
+	themeBox(button)
+	themeText(button)
+	if callback then
+		button.MouseButton1Click:Connect(callback)
+	end
+	return button
+end
+
+local function newTextBox(parent, text, pos, size, onCommit)
+	local box = make("TextBox", {
+		FontFace = FONT,
+		Text = text,
+		TextSize = 12,
+		ClearTextOnFocus = false,
+		BorderSizePixel = 1,
+		Position = pos,
+		Size = size,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+	themeBox(box)
+	themeText(box)
+	if onCommit then
+		box.FocusLost:Connect(function(enter)
+			onCommit(box, enter)
+		end)
+	end
+	return box
+end
+
+local function disconnectList(list)
+	for _, connection in ipairs(list) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(list)
+end
+
+local function sortActions(draft)
+	table.sort(draft.actions, function(a, b)
+		return a.when < b.when
+	end)
+end
+
+local function onOff(value)
+	return value and "ON" or "OFF"
+end
+
+---------------------------------------------------------------------------
+-- Factory
+---------------------------------------------------------------------------
+local function create(kind)
+	local isSound = kind == "Sound"
+	local cfg
+	if isSound then
+		cfg = {
+			title = "Sound Logger",
+			toggleKey = "SoundLoggerEnabled",
+			guiName = "SoundLogger",
+			waiting = "Waiting for a sound...",
+			selectHint = "Select a logged sound on the left.",
+			searchHint = "search name / sound id",
+			container = function()
+				return SaveManager.ss and SaveManager.ss.config or nil
+			end,
+			pair = function()
+				return SaveManager.ss
+			end,
+			newTiming = SoundTiming.new,
+		}
+	else
+		cfg = {
+			title = "Effect Logger",
+			toggleKey = "EffectLoggerEnabled",
+			guiName = "EffectLogger",
+			waiting = "Waiting for an effect...",
+			selectHint = "Select a logged effect on the left.",
+			searchHint = "search owner / effect name",
+			container = function()
+				return SaveManager.es and SaveManager.es.config or nil
+			end,
+			pair = function()
+				return SaveManager.es
+			end,
+			newTiming = EffectTiming.new,
+		}
+	end
+	local prefix = cfg.title .. ": "
+
+	local api = {}
+
+	local settings = {
+		range = 100,
+		includeSelf = false,
+		hideKnown = false,
+		search = "",
+		span = 1500,
+		muted = false,
+	}
+
+	local enabled = false
+	local entries = {}
+	local byKey = {}
+	local selected = nil
+	local rowsDirty = false
+	local lastRowRefresh = 0
+
+	local hooked = setmetatable({}, { __mode = "k" })
+	local liveConnections = {}
+	local globalConnections = {}
+
+	local ui = nil
+	local preview = nil
+	local loadToken = 0
+	local dragging = false
+	local holdStartMs = nil
+
+	-----------------------------------------------------------------------
+	-- Config access
+	-----------------------------------------------------------------------
+	local function userContainer()
+		return cfg.container()
+	end
+
+	-- "user" = saved in your own config, "builtin" = shipped timing, nil = none
+	local function timingStatus(key)
+		local container = userContainer()
+		if container and container.timings[key] then
+			return "user"
+		end
+		local pair = cfg.pair()
+		if pair and pair:index(key) then
+			return "builtin"
+		end
+		return nil
+	end
+
+	local function ensureConfig()
+		if SaveManager.llcn then
+			return SaveManager.llcn
+		end
+
+		local exists = false
+		local okList, list = pcall(SaveManager.list)
+		if okList and typeof(list) == "table" then
+			exists = table.find(list, DEFAULT_SAVE_NAME) ~= nil
+		end
+
+		if exists then
+			-- Never overwrite an existing file we failed to read.
+			pcall(SaveManager.load, DEFAULT_SAVE_NAME)
+			return SaveManager.llcn
+		end
+
+		SaveManager.llcn = DEFAULT_SAVE_NAME
+		pcall(SaveManager.autoload, DEFAULT_SAVE_NAME)
+		return DEFAULT_SAVE_NAME
+	end
+
+	local function persist()
+		local name = SaveManager.llcn or DEFAULT_SAVE_NAME
+		local ok, code = pcall(SaveManager.write, name)
+		return ok and code == 0
+	end
+
+	-----------------------------------------------------------------------
+	-- Logging
+	-----------------------------------------------------------------------
+	local function recordEntry(key)
+		local entry = byKey[key]
+		if not entry then
+			entry = {
+				key = key,
+				count = 0,
+				length = 0,
+				draft = nil,
+				lastSeen = os.clock(),
+				entityName = "Unknown",
+				distance = 0,
+				info = "",
+			}
+			byKey[key] = entry
+			entries[#entries + 1] = entry
+			if #entries > MAX_ENTRIES then
+				local oldestIdx, oldestTime = nil, math.huge
+				for idx, candidate in ipairs(entries) do
+					if candidate ~= selected and candidate.lastSeen < oldestTime then
+						oldestIdx, oldestTime = idx, candidate.lastSeen
+					end
+				end
+				if oldestIdx then
+					local removed = table.remove(entries, oldestIdx)
+					byKey[removed.key] = nil
+					if removed.row then
+						removed.row:Destroy()
+					end
+				end
+			end
+		end
+		entry.count = entry.count + 1
+		entry.lastSeen = os.clock()
+		rowsDirty = true
+		return entry
+	end
+
+	-- Sounds ------------------------------------------------------------------
+	local function onSoundPlayed(sound)
+		if not enabled then
+			return
+		end
+		local rawId = tostring(sound.SoundId)
+		if rawId == "" then
+			return
+		end
+		-- Sound timings only ever run for sounds that live inside a part.
+		local part = sound:FindFirstAncestorWhichIsA("BasePart")
+		if not part then
+			return
+		end
+		local model = sound:FindFirstAncestorWhichIsA("Model")
+		local character = Players.LocalPlayer and Players.LocalPlayer.Character
+		if model and character and model == character and not settings.includeSelf then
+			return
+		end
+		local distance = distanceToPart(part)
+		if not distance or distance > settings.range then
+			return
+		end
+
+		local entry = recordEntry(rawId)
+		entry.entity = model
+		entry.entityName = model and model.Name or part.Name
+		entry.distance = distance
+		local length = tonumber(sound.TimeLength) or 0
+		if length > 0 then
+			entry.length = length
+		end
+		entry.info = string.format(
+			"%s | vol %.2f | speed %.2f%s",
+			sound.Name,
+			tonumber(sound.Volume) or 0,
+			tonumber(sound.PlaybackSpeed) or 1,
+			sound.Looped and " | looped" or ""
+		)
+	end
+
+	local function hookSound(sound, logIfPlaying)
+		if hooked[sound] then
+			return
+		end
+		hooked[sound] = sound.Played:Connect(function()
+			onSoundPlayed(sound)
+		end)
+		sound.Destroying:Connect(function()
+			local existing = hooked[sound]
+			if existing then
+				existing:Disconnect()
+				hooked[sound] = nil
+			end
+		end)
+		if logIfPlaying and sound.IsPlaying then
+			onSoundPlayed(sound)
+		end
+	end
+
+	-- Effects -----------------------------------------------------------------
+	local function findEffectOwner(data)
+		local live = Workspace:FindFirstChild("Live")
+		if not live then
+			return nil
+		end
+		for _, value in next, data do
+			if typeof(value) == "Instance" and value.Parent == live then
+				return value
+			end
+		end
+		return nil
+	end
+
+	local function summarize(data)
+		local parts, count = {}, 0
+		for key, value in next, data do
+			count = count + 1
+			if count > 8 then
+				parts[#parts + 1] = "..."
+				break
+			end
+			local kindOf = typeof(value)
+			local shown
+			if kindOf == "string" or kindOf == "number" or kindOf == "boolean" then
+				shown = tostring(value)
+			elseif kindOf == "Instance" then
+				shown = value.Name
+			else
+				shown = kindOf
+			end
+			if #shown > 24 then
+				shown = shown:sub(1, 24) .. "~"
+			end
+			parts[#parts + 1] = tostring(key) .. "=" .. shown
+		end
+		return table.concat(parts, ", ")
+	end
+
+	local function onEffectEvent(name, data)
+		if not enabled or typeof(name) ~= "string" or name == "" then
+			return
+		end
+		if typeof(data) ~= "table" then
+			data = {}
+		end
+		-- Effect timings only ever run for effects that belong to something in workspace.Live.
+		local owner = findEffectOwner(data)
+		if not owner then
+			return
+		end
+		local character = Players.LocalPlayer and Players.LocalPlayer.Character
+		if character and owner == character and not settings.includeSelf then
+			return
+		end
+		local distance = distanceToPart(getRoot(owner))
+		if not distance or distance > settings.range then
+			return
+		end
+
+		local entry = recordEntry(name)
+		entry.entity = owner
+		entry.entityName = owner.Name
+		entry.distance = distance
+		entry.info = summarize(data)
+	end
+
+	local function connectEffectSources()
+		local requests = ReplicatedStorage:FindFirstChild("Requests")
+		if not requests then
+			return notify(prefix .. "could not find the effect remotes.")
+		end
+		for _, sourceName in ipairs(EFFECT_SOURCES) do
+			local source = requests:FindFirstChild(sourceName)
+			local signal = nil
+			if source and source:IsA("BindableEvent") then
+				signal = source.Event
+			elseif source and (source:IsA("RemoteEvent") or source:IsA("UnreliableRemoteEvent")) then
+				signal = source.OnClientEvent
+			end
+			if signal then
+				liveConnections[#liveConnections + 1] = signal:Connect(function(...)
+					pcall(onEffectEvent, ...)
+				end)
+			end
+		end
+	end
+
+	function api.setEnabled(state)
+		state = state and true or false
+		if state == enabled then
+			return
+		end
+		enabled = state
+
+		if ui and ui.logToggle then
+			ui.logToggle.Text = enabled and "Logging: ON" or "Logging: OFF"
+		end
+
+		if not enabled then
+			disconnectList(liveConnections)
+			for sound, connection in next, hooked do
+				pcall(function()
+					connection:Disconnect()
+				end)
+				hooked[sound] = nil
+			end
+			return
+		end
+
+		if isSound then
+			for _, descendant in ipairs(Workspace:GetDescendants()) do
+				if descendant:IsA("Sound") then
+					hookSound(descendant, false)
+				end
+			end
+			liveConnections[#liveConnections + 1] = Workspace.DescendantAdded:Connect(function(descendant)
+				if descendant:IsA("Sound") then
+					hookSound(descendant, true)
+				end
+			end)
+		else
+			connectEffectSources()
+		end
+	end
+
+	function api.setRange(value)
+		settings.range = tonumber(value) or settings.range
+	end
+
+	function api.setIncludeSelf(value)
+		settings.includeSelf = value and true or false
+	end
+
+	-----------------------------------------------------------------------
+	-- Draft (the timing being built for the selected entry)
+	-----------------------------------------------------------------------
+	local function defaultName(entry)
+		if isSound then
+			local short = entry.key:match("(%d+)$") or entry.key
+			return string.format("%s - %s", entry.entityName or "Sound", short)
+		end
+		return string.format("%s - %s", entry.entityName or "Effect", entry.key)
+	end
+
+	local function newDraft(entry)
+		return {
+			name = defaultName(entry),
+			tag = "Undefined",
+			maxDist = 60,
+			hitbox = Vector3.new(20, 20, 25),
+			actions = {},
+			alp = false,
+			ilp = false,
+			flp = false,
+		}
+	end
+
+	local function draftFromTiming(timing, entry)
+		local draft = newDraft(entry)
+		draft.name = timing.name or draft.name
+		draft.tag = timing.tag or "Undefined"
+		draft.maxDist = tonumber(timing.imxd) or 60
+		draft.hitbox = timing.hitbox or draft.hitbox
+		draft.alp = timing.alp == true
+		draft.ilp = timing.ilp == true
+		draft.flp = timing.flp == true
+		local ok, stack = pcall(function()
+			return timing.actions:stack()
+		end)
+		if ok and stack then
+			for _, action in ipairs(stack) do
+				draft.actions[#draft.actions + 1] = {
+					type = action._type,
+					when = math.floor((tonumber(action._when) or 0) + 0.5),
+					hb = action.hitbox,
+				}
+			end
+		end
+		sortActions(draft)
+		return draft
+	end
+
+	local function getDraft(entry)
+		if entry.draft then
+			return entry.draft
+		end
+		local container = userContainer()
+		local existing = container and container.timings[entry.key]
+		entry.draft = existing and draftFromTiming(existing, entry) or newDraft(entry)
+		return entry.draft
+	end
+
+	local function uniqueTimingName(base, ownKey)
+		local pair = cfg.pair()
+		local name = base
+		local n = 1
+		while true do
+			local found = pair and pair:find(name)
+			if not found then
+				return name
+			end
+			local foundKey = isSound and found._id or found.ename
+			if foundKey == ownKey then
+				return name
+			end
+			n = n + 1
+			name = string.format("%s (%d)", base, n)
+		end
+	end
+
+	local function saveDraft(entry)
+		local draft = getDraft(entry)
+		if #draft.actions == 0 then
+			return notify(prefix .. "add at least one action before saving.")
+		end
+
+		if not ensureConfig() then
+			return notify(prefix .. "could not load your '%s' timing file, so nothing was overwritten.", DEFAULT_SAVE_NAME)
+		end
+		local container = userContainer()
+		if not container then
+			return notify(prefix .. "timing container is not ready yet.")
+		end
+
+		sortActions(draft)
+
+		local timing = cfg.newTiming()
+		if isSound then
+			timing._id = entry.key
+			timing.alp = draft.alp == true
+		else
+			timing.ename = entry.key
+			timing.ilp = draft.ilp == true
+			timing.flp = draft.flp == true
+		end
+		timing.name = uniqueTimingName(draft.name ~= "" and draft.name or defaultName(entry), entry.key)
+		timing.tag = draft.tag
+		timing.imdd = 0
+		timing.imxd = draft.maxDist
+		timing.hitbox = draft.hitbox
+
+		local used = {}
+		for _, act in ipairs(draft.actions) do
+			local action = Action.new()
+			action._type = act.type
+			action._when = act.when
+			local base = string.format("%s %dms", act.type, act.when)
+			local name, n = base, 1
+			while used[name] do
+				n = n + 1
+				name = string.format("%s #%d", base, n)
+			end
+			used[name] = true
+			action.name = name
+			action.hitbox = act.hb or draft.hitbox
+			timing.actions:push(action)
+		end
+
+		local previous = container.timings[entry.key]
+		if previous then
+			container.timings[entry.key] = nil
+		end
+
+		local ok, err = pcall(container.push, container, timing)
+		if not ok then
+			if previous then
+				container.timings[entry.key] = previous
+			end
+			return notify(prefix .. "failed to add timing (%s).", tostring(err))
+		end
+
+		draft.name = timing.name
+		if persist() then
+			notify(prefix .. "saved '%s' to your timing config.", timing.name)
+		else
+			notify(prefix .. "added '%s' but writing the config file failed.", timing.name)
+		end
+		rowsDirty = true
+	end
+
+	local function deleteSaved(entry)
+		local container = userContainer()
+		local existing = container and container.timings[entry.key]
+		if not existing then
+			return notify(prefix .. "nothing saved for this entry.")
+		end
+		container.timings[entry.key] = nil
+		entry.draft = nil
+		if ensureConfig() then
+			persist()
+		end
+		notify(prefix .. "removed saved timing '%s'.", tostring(existing.name))
+		rowsDirty = true
+	end
+
+	-----------------------------------------------------------------------
+	-- Preview
+	-----------------------------------------------------------------------
+	local function showMessage(text)
+		if ui then
+			ui.previewMsg.Text = text
+		end
+	end
+
+	local function clearPreview()
+		if preview and preview.sound then
+			pcall(function()
+				preview.sound:Stop()
+				preview.sound:Destroy()
+			end)
+		end
+		preview = nil
+	end
+
+	local function loadPreview(entry)
+		clearPreview()
+		loadToken = loadToken + 1
+		local token = loadToken
+
+		if not isSound then
+			preview = {
+				entry = entry,
+				total = math.max(settings.span, 100) / 1000,
+				elapsed = 0,
+				paused = false,
+			}
+			if ui then
+				ui.rebuildMarkers()
+				ui.refreshInfo()
+			end
+			return
+		end
+
+		showMessage("Loading sound...")
+		local sound = Instance.new("Sound")
+		sound.Name = "TimingLoggerPreview"
+		sound.SoundId = entry.key
+		sound.Volume = settings.muted and 0 or 0.5
+		sound.Looped = false
+		sound.Parent = SoundService
+
+		task.spawn(function()
+			local started = os.clock()
+			while (sound.TimeLength <= 0 or not sound.IsLoaded) and os.clock() - started < 4 do
+				task.wait()
+			end
+			if token ~= loadToken or not ui then
+				pcall(function()
+					sound:Destroy()
+				end)
+				return
+			end
+			local length = sound.TimeLength
+			if length <= 0 then
+				pcall(function()
+					sound:Destroy()
+				end)
+				return showMessage("Sound did not load (no access or invalid id).")
+			end
+			entry.length = length
+			preview = {
+				entry = entry,
+				sound = sound,
+				total = length,
+				elapsed = 0,
+				paused = false,
+			}
+			showMessage(string.format(
+				"SOUND  %s\nowner: %s  |  len %.3fs\n%s",
+				entry.key,
+				entry.entityName or "?",
+				length,
+				entry.info or ""
+			))
+			ui.rebuildMarkers()
+			ui.refreshInfo()
+		end)
+	end
+
+	-----------------------------------------------------------------------
+	-- UI: list rows, markers, action rows
+	-----------------------------------------------------------------------
+	local function rowText(entry)
+		local mark = timingStatus(entry.key) and '<font color="#5FD068">[+]</font> ' or ""
+		return string.format(
+			'%s<b>%s</b>  x%d  -  %d studs\n<font color="#9A9A9A">%s</font>',
+			mark,
+			esc(entry.entityName or "?"),
+			entry.count,
+			math.floor((entry.distance or 0) + 0.5),
+			esc(entry.key)
+		)
+	end
+
+	local function entryVisible(entry)
+		if entry == selected then
+			return true
+		end
+		if settings.hideKnown and timingStatus(entry.key) then
+			return false
+		end
+		local query = settings.search
+		if query ~= "" then
+			local hay = ((entry.entityName or "") .. " " .. entry.key):lower()
+			if not hay:find(query, 1, true) then
+				return false
+			end
+		end
+		return true
+	end
+
+	local function refreshRows()
+		if not ui then
+			return
+		end
+		for _, entry in ipairs(entries) do
+			if not entry.row then
+				local row = make("TextButton", {
+					AutoButtonColor = true,
+					BorderSizePixel = 1,
+					FontFace = FONT,
+					RichText = true,
+					Text = "",
+					TextSize = 12,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextYAlignment = Enum.TextYAlignment.Center,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					Size = UDim2.new(1, -6, 0, 34),
+				}, ui.list)
+				themeBox(row)
+				themeText(row)
+				row.MouseButton1Click:Connect(function()
+					api.select(entry)
+				end)
+				entry.row = row
+			end
+			local row = entry.row
+			row.Text = " " .. rowText(entry)
+			row.LayoutOrder = -math.floor((entry.lastSeen or 0) * 100)
+			row.Visible = entryVisible(entry)
+			row.BackgroundColor3 = (entry == selected) and Library.AccentColor or Library.MainColor
+			row.TextColor3 = (entry == selected) and Color3.new(0, 0, 0) or Library.FontColor
+		end
+		ui.countLabel.Text = string.format("%d logged", #entries)
+		rowsDirty = false
+	end
+
+	local function rebuildMarkers()
+		if not ui then
+			return
+		end
+		for _, child in ipairs(ui.markerHolder:GetChildren()) do
+			child:Destroy()
+		end
+		if not preview or not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		local total = math.max(preview.total * 1000, 1)
+		for _, act in ipairs(draft.actions) do
+			make("Frame", {
+				BackgroundColor3 = ACTION_COLORS[act.type] or Color3.new(1, 1, 1),
+				BorderSizePixel = 0,
+				Position = UDim2.new(math.clamp(act.when / total, 0, 1), -1, 0, 0),
+				Size = UDim2.new(0, 3, 1, 0),
+				ZIndex = 6,
+			}, ui.markerHolder)
+		end
+	end
+
+	local function seekMs(ms)
+		if not preview then
+			return
+		end
+		preview.paused = true
+		preview.elapsed = math.clamp(ms / 1000, 0, preview.total)
+	end
+
+	local function stepMs(delta)
+		if not preview then
+			return
+		end
+		preview.paused = true
+		preview.elapsed = math.clamp(preview.elapsed + delta / 1000, 0, preview.total)
+	end
+
+	local function rebuildActionRows()
+		if not ui then
+			return
+		end
+		for _, child in ipairs(ui.actionList:GetChildren()) do
+			if child:IsA("Frame") then
+				child:Destroy()
+			end
+		end
+		if not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		sortActions(draft)
+		for idx, act in ipairs(draft.actions) do
+			local row = make("Frame", {
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				LayoutOrder = idx,
+				Size = UDim2.new(1, -6, 0, 20),
+			}, ui.actionList)
+
+			make("Frame", {
+				BackgroundColor3 = ACTION_COLORS[act.type] or Color3.new(1, 1, 1),
+				BorderSizePixel = 0,
+				Position = UDim2.new(0, 2, 0, 4),
+				Size = UDim2.new(0, 6, 0, 12),
+			}, row)
+			newLabel(row, act.type, UDim2.new(0, 14, 0, 0), UDim2.new(0, 120, 1, 0), 12)
+			newTextBox(row, tostring(act.when), UDim2.new(0, 140, 0, 1), UDim2.new(0, 64, 0, 18), function(box)
+				local value = tonumber(box.Text)
+				if value then
+					act.when = math.max(math.floor(value + 0.5), 0)
+				end
+				rebuildActionRows()
+				rebuildMarkers()
+			end)
+			newLabel(row, "ms", UDim2.new(0, 208, 0, 0), UDim2.new(0, 24, 1, 0), 12)
+			newButton(row, "Go", UDim2.new(0, 236, 0, 1), UDim2.new(0, 40, 0, 18), function()
+				seekMs(act.when)
+			end)
+			newButton(row, "X", UDim2.new(0, 280, 0, 1), UDim2.new(0, 28, 0, 18), function()
+				table.remove(draft.actions, idx)
+				rebuildActionRows()
+				rebuildMarkers()
+			end)
+		end
+	end
+
+	local function refreshInfo()
+		if not ui then
+			return
+		end
+		if not selected then
+			ui.info.Text = cfg.selectHint
+			return
+		end
+		local status = timingStatus(selected.key)
+		local statusText = status == "user" and "saved (yours)" or status == "builtin" and "built-in timing exists" or "no timing yet"
+		local lengthText = ""
+		if isSound then
+			lengthText = string.format("len %.3fs | ", selected.length or 0)
+		end
+		ui.info.Text = string.format(
+			"%s | %s\n%sseen x%d | %s",
+			selected.entityName or "?",
+			selected.key,
+			lengthText,
+			selected.count,
+			statusText
+		)
+	end
+
+	local function refreshSettingsRow()
+		if not ui or not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		ui.nameBox.Text = draft.name
+		ui.tagButton.Text = draft.tag
+		ui.hitboxBox.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
+		ui.distBox.Text = tostring(draft.maxDist)
+		if isSound then
+			ui.alpButton.Text = "Allow local player: " .. onOff(draft.alp)
+		else
+			ui.ilpButton.Text = "Ignore local player: " .. onOff(draft.ilp)
+			ui.flpButton.Text = "Local player only: " .. onOff(draft.flp)
+		end
+	end
+
+	function api.select(entry)
+		selected = entry
+		holdStartMs = nil
+		if ui then
+			ui.holdButton.Text = "Hold Block"
+		end
+		rowsDirty = true
+		refreshRows()
+		refreshInfo()
+		refreshSettingsRow()
+		rebuildActionRows()
+		loadPreview(entry)
+	end
+
+	local function addAction(actionType)
+		if not selected then
+			return notify(prefix .. "select an entry first.")
+		end
+		local ms = preview and math.floor(preview.elapsed * 1000 + 0.5) or 0
+		local draft = getDraft(selected)
+		draft.actions[#draft.actions + 1] = { type = actionType, when = ms }
+		rebuildActionRows()
+		rebuildMarkers()
+	end
+
+	local function onHoldBlock()
+		if not selected then
+			return notify(prefix .. "select an entry first.")
+		end
+		local ms = preview and math.floor(preview.elapsed * 1000 + 0.5) or 0
+		local draft = getDraft(selected)
+		if not holdStartMs then
+			holdStartMs = ms
+			draft.actions[#draft.actions + 1] = { type = "Start Block", when = ms }
+			ui.holdButton.Text = "Hold: set END"
+		else
+			draft.actions[#draft.actions + 1] = { type = "End Block", when = math.max(ms, holdStartMs) }
+			holdStartMs = nil
+			ui.holdButton.Text = "Hold Block"
+		end
+		rebuildActionRows()
+		rebuildMarkers()
+	end
+
+	-----------------------------------------------------------------------
+	-- Window
+	-----------------------------------------------------------------------
+	local function buildGui()
+		local screenGui = CoreGuiManager.imark(Instance.new("ScreenGui"))
+		screenGui.Name = cfg.guiName
+		screenGui.ResetOnSpawn = false
+		screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		screenGui.DisplayOrder = 50
+		screenGui.Enabled = false
+		pcall(function()
+			if protectgui then
+				protectgui(screenGui)
+			end
+		end)
+		local okParent = pcall(function()
+			screenGui.Parent = game:GetService("CoreGui")
+		end)
+		if not okParent then
+			screenGui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+		end
+
+		local outer = make("Frame", {
+			Name = "Outer",
+			BackgroundColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0,
+			Position = UDim2.new(0.5, -390, 0.5, -260),
+			Size = UDim2.new(0, 780, 0, 520),
+			ZIndex = 2,
+		}, screenGui)
+
+		local inner = make("Frame", {
+			Name = "Inner",
+			BorderMode = Enum.BorderMode.Inset,
+			BorderSizePixel = 1,
+			Size = UDim2.new(1, 0, 1, 0),
+		}, outer)
+		themeBox(inner, "BackgroundColor")
+
+		local accentBar = make("Frame", { BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 2) }, inner)
+		accentBar.BackgroundColor3 = Library.AccentColor
+		Library:AddToRegistry(accentBar, { BackgroundColor3 = "AccentColor" }, true)
+
+		newLabel(inner, cfg.title, UDim2.new(0, 8, 0, 4), UDim2.new(0, 200, 0, 22), 15, "AccentColor")
+
+		ui = { screenGui = screenGui, outer = outer }
+
+		ui.logToggle = newButton(
+			inner,
+			enabled and "Logging: ON" or "Logging: OFF",
+			UDim2.new(1, -330, 0, 5),
+			UDim2.new(0, 110, 0, 20),
+			function()
+				local toggle = Toggles and Toggles[cfg.toggleKey]
+				if toggle then
+					toggle:SetValue(not toggle.Value)
+				else
+					api.setEnabled(not enabled)
+				end
+			end
+		)
+		newButton(inner, "Clear", UDim2.new(1, -214, 0, 5), UDim2.new(0, 60, 0, 20), function()
+			api.clear()
+		end)
+		ui.countLabel = newLabel(inner, "0 logged", UDim2.new(1, -148, 0, 4), UDim2.new(0, 90, 0, 22), 12)
+		newButton(inner, "X", UDim2.new(1, -30, 0, 5), UDim2.new(0, 24, 0, 20), function()
+			screenGui.Enabled = false
+		end)
+
+		-- Left panel ---------------------------------------------------------
+		ui.search = newTextBox(inner, "", UDim2.new(0, 6, 0, 32), UDim2.new(0, 158, 0, 22), function(box)
+			settings.search = box.Text:lower()
+			rowsDirty = true
+		end)
+		ui.search.PlaceholderText = cfg.searchHint
+		ui.search.PlaceholderColor3 = Color3.fromRGB(130, 130, 140)
+		ui.hideKnown = newButton(inner, "Hide known: OFF", UDim2.new(0, 168, 0, 32), UDim2.new(0, 88, 0, 22), function()
+			settings.hideKnown = not settings.hideKnown
+			ui.hideKnown.Text = settings.hideKnown and "Hide known: ON" or "Hide known: OFF"
+			rowsDirty = true
+		end)
+		ui.hideKnown.TextSize = 10
+
+		ui.list = make("ScrollingFrame", {
+			BorderSizePixel = 1,
+			Position = UDim2.new(0, 6, 0, 58),
+			Size = UDim2.new(0, 250, 1, -64),
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 4,
+		}, inner)
+		themeBox(ui.list)
+		ui.list.ScrollBarImageColor3 = Library.AccentColor
+		make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, ui.list)
+		make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingLeft = UDim.new(0, 2) }, ui.list)
+
+		-- Right panel --------------------------------------------------------
+		local right = make("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 262, 0, 32),
+			Size = UDim2.new(1, -268, 1, -38),
+		}, inner)
+
+		ui.info = newLabel(right, cfg.selectHint, UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 34), 11)
+		ui.info.TextWrapped = true
+		ui.info.TextYAlignment = Enum.TextYAlignment.Top
+
+		ui.previewMsg = make("TextLabel", {
+			FontFace = FONT,
+			Text = cfg.waiting,
+			TextSize = 12,
+			TextWrapped = true,
+			BorderSizePixel = 1,
+			Position = UDim2.new(0, 0, 0, 38),
+			Size = UDim2.new(1, 0, 0, 80),
+		}, right)
+		themeBox(ui.previewMsg)
+		themeText(ui.previewMsg)
+
+		-- Timeline -----------------------------------------------------------
+		ui.timeline = make("Frame", {
+			BorderSizePixel = 1,
+			Position = UDim2.new(0, 0, 0, 122),
+			Size = UDim2.new(1, 0, 0, 26),
+		}, right)
+		themeBox(ui.timeline)
+		ui.fill = make("Frame", { BorderSizePixel = 0, Size = UDim2.new(0, 0, 1, 0), BackgroundTransparency = 0.7, ZIndex = 2 }, ui.timeline)
+		ui.fill.BackgroundColor3 = Library.AccentColor
+		Library:AddToRegistry(ui.fill, { BackgroundColor3 = "AccentColor" }, true)
+		ui.markerHolder = make("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), ZIndex = 5 }, ui.timeline)
+		ui.playhead = make("Frame", {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Size = UDim2.new(0, 2, 1, 0),
+			ZIndex = 8,
+		}, ui.timeline)
+		ui.timeLabel = make("TextLabel", {
+			BackgroundTransparency = 1,
+			FontFace = FONT,
+			Text = "0 ms / 0 ms",
+			TextSize = 11,
+			Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 9,
+			TextStrokeTransparency = 0.5,
+		}, ui.timeline)
+		themeText(ui.timeLabel)
+
+		-- Transport ----------------------------------------------------------
+		local y = 154
+		ui.playButton = newButton(right, "Pause", UDim2.new(0, 0, 0, y), UDim2.new(0, 70, 0, 22), function()
+			if preview then
+				preview.paused = not preview.paused
+			end
+		end)
+		newButton(right, "-10ms", UDim2.new(0, 76, 0, y), UDim2.new(0, 54, 0, 22), function()
+			stepMs(-10)
+		end)
+		newButton(right, "-1ms", UDim2.new(0, 134, 0, y), UDim2.new(0, 50, 0, 22), function()
+			stepMs(-1)
+		end)
+		newButton(right, "+1ms", UDim2.new(0, 188, 0, y), UDim2.new(0, 50, 0, 22), function()
+			stepMs(1)
+		end)
+		newButton(right, "+10ms", UDim2.new(0, 242, 0, y), UDim2.new(0, 54, 0, 22), function()
+			stepMs(10)
+		end)
+		if isSound then
+			ui.muteButton = newButton(right, "Mute: OFF", UDim2.new(0, 302, 0, y), UDim2.new(0, 84, 0, 22), function()
+				settings.muted = not settings.muted
+				ui.muteButton.Text = settings.muted and "Mute: ON" or "Mute: OFF"
+				if preview and preview.sound then
+					preview.sound.Volume = settings.muted and 0 or 0.5
+				end
+			end)
+		else
+			newLabel(right, "span ms", UDim2.new(0, 302, 0, y), UDim2.new(0, 52, 0, 22), 11)
+			ui.spanBox = newTextBox(right, tostring(settings.span), UDim2.new(0, 356, 0, y), UDim2.new(0, 60, 0, 22), function(box)
+				local value = tonumber(box.Text)
+				if value then
+					settings.span = math.clamp(math.floor(value + 0.5), 100, 20000)
+				end
+				box.Text = tostring(settings.span)
+				if preview and not preview.sound then
+					preview.total = settings.span / 1000
+					preview.elapsed = math.min(preview.elapsed, preview.total)
+					rebuildMarkers()
+				end
+			end)
+		end
+
+		-- Action palette -----------------------------------------------------
+		y = 182
+		local width = 70
+		for idx, actionType in ipairs(PALETTE) do
+			local button = newButton(right, PALETTE_LABELS[idx], UDim2.new(0, (idx - 1) * (width + 4), 0, y), UDim2.new(0, width, 0, 22), function()
+				addAction(actionType)
+			end)
+			button.TextSize = 11
+			local stripe = make("Frame", {
+				BackgroundColor3 = ACTION_COLORS[actionType],
+				BorderSizePixel = 0,
+				Position = UDim2.new(0, 0, 1, -2),
+				Size = UDim2.new(1, 0, 0, 2),
+			}, button)
+			stripe.ZIndex = button.ZIndex + 1
+		end
+		ui.holdButton = newButton(right, "Hold Block", UDim2.new(0, 6 * (width + 4), 0, y), UDim2.new(0, 86, 0, 22), onHoldBlock)
+		ui.holdButton.TextSize = 11
+
+		-- Action list --------------------------------------------------------
+		ui.actionList = make("ScrollingFrame", {
+			BorderSizePixel = 1,
+			Position = UDim2.new(0, 0, 0, 210),
+			Size = UDim2.new(1, 0, 0, 150),
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 4,
+		}, right)
+		themeBox(ui.actionList)
+		ui.actionList.ScrollBarImageColor3 = Library.AccentColor
+		make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 0) }, ui.actionList)
+
+		-- Settings row -------------------------------------------------------
+		y = 366
+		ui.nameBox = newTextBox(right, "", UDim2.new(0, 0, 0, y), UDim2.new(0, 200, 0, 22), function(box)
+			if selected then
+				getDraft(selected).name = box.Text
+			end
+		end)
+		ui.nameBox.PlaceholderText = "timing name"
+		ui.tagButton = newButton(right, "Undefined", UDim2.new(0, 204, 0, y), UDim2.new(0, 76, 0, 22), function()
+			if not selected then
+				return
+			end
+			local draft = getDraft(selected)
+			local idx = table.find(TAGS, draft.tag) or 1
+			draft.tag = TAGS[(idx % #TAGS) + 1]
+			ui.tagButton.Text = draft.tag
+		end)
+		newLabel(right, "hitbox", UDim2.new(0, 286, 0, y), UDim2.new(0, 42, 0, 22), 11)
+		ui.hitboxBox = newTextBox(right, "20, 20, 25", UDim2.new(0, 328, 0, y), UDim2.new(0, 96, 0, 22), function(box)
+			if selected then
+				local draft = getDraft(selected)
+				draft.hitbox = parseVector(box.Text, draft.hitbox)
+				box.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
+			end
+		end)
+		newLabel(right, "max dist", UDim2.new(0, 430, 0, y), UDim2.new(0, 52, 0, 22), 11)
+		ui.distBox = newTextBox(right, "60", UDim2.new(0, 482, 0, y), UDim2.new(0, 40, 0, 22), function(box)
+			if selected then
+				local draft = getDraft(selected)
+				draft.maxDist = tonumber(box.Text) or draft.maxDist
+				box.Text = tostring(draft.maxDist)
+			end
+		end)
+
+		-- Flags row ----------------------------------------------------------
+		y = 392
+		if isSound then
+			ui.alpButton = newButton(right, "Allow local player: OFF", UDim2.new(0, 0, 0, y), UDim2.new(0, 190, 0, 22), function()
+				if selected then
+					local draft = getDraft(selected)
+					draft.alp = not draft.alp
+					refreshSettingsRow()
+				end
+			end)
+			ui.alpButton.TextSize = 11
+		else
+			ui.ilpButton = newButton(right, "Ignore local player: OFF", UDim2.new(0, 0, 0, y), UDim2.new(0, 190, 0, 22), function()
+				if selected then
+					local draft = getDraft(selected)
+					draft.ilp = not draft.ilp
+					refreshSettingsRow()
+				end
+			end)
+			ui.ilpButton.TextSize = 11
+			ui.flpButton = newButton(right, "Local player only: OFF", UDim2.new(0, 196, 0, y), UDim2.new(0, 190, 0, 22), function()
+				if selected then
+					local draft = getDraft(selected)
+					draft.flp = not draft.flp
+					refreshSettingsRow()
+				end
+			end)
+			ui.flpButton.TextSize = 11
+		end
+
+		-- Save row -----------------------------------------------------------
+		y = 420
+		local saveButton = newButton(right, "Save To Script", UDim2.new(0, 0, 0, y), UDim2.new(0, 170, 0, 26), function()
+			if selected then
+				saveDraft(selected)
+				refreshInfo()
+				refreshRows()
+				rebuildMarkers()
+			else
+				notify(prefix .. "select an entry first.")
+			end
+		end)
+		saveButton.BackgroundColor3 = Library.AccentColor
+		saveButton.TextColor3 = Color3.new(0, 0, 0)
+		newButton(right, "Delete Saved", UDim2.new(0, 176, 0, y), UDim2.new(0, 110, 0, 26), function()
+			if selected then
+				deleteSaved(selected)
+				refreshInfo()
+				refreshRows()
+				refreshSettingsRow()
+				rebuildActionRows()
+				rebuildMarkers()
+			end
+		end)
+		newButton(right, "Clear Actions", UDim2.new(0, 292, 0, y), UDim2.new(0, 110, 0, 26), function()
+			if selected then
+				getDraft(selected).actions = {}
+				holdStartMs = nil
+				ui.holdButton.Text = "Hold Block"
+				rebuildActionRows()
+				rebuildMarkers()
+			end
+		end)
+		newLabel(right, "Saved timings go live immediately and load every session.", UDim2.new(0, 0, 0, y + 30), UDim2.new(1, 0, 0, 14), 10)
+		newLabel(
+			right,
+			isSound and "0 ms = the moment the sound starts.  Space = pause   Left/Right = step 10ms"
+				or "0 ms = the moment the effect fires.  Space = pause   Left/Right = step 10ms",
+			UDim2.new(0, 0, 0, y + 44),
+			UDim2.new(1, 0, 0, 14),
+			10
+		)
+
+		ui.rebuildMarkers = rebuildMarkers
+		ui.refreshInfo = refreshInfo
+
+		-- Dragging / seeking / hotkeys ---------------------------------------
+		Library:MakeDraggable(outer)
+
+		local function seekFromMouse()
+			if not preview then
+				return
+			end
+			local x = UserInputService:GetMouseLocation().X - ui.timeline.AbsolutePosition.X
+			local frac = math.clamp(x / math.max(ui.timeline.AbsoluteSize.X, 1), 0, 1)
+			preview.elapsed = frac * preview.total
+		end
+
+		ui.timeline.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				if preview then
+					preview.paused = true
+				end
+				seekFromMouse()
+			end
+		end)
+
+		globalConnections[#globalConnections + 1] = UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+
+		outer.InputBegan:Connect(function(input, processed)
+			if processed or not preview then
+				return
+			end
+			if input.KeyCode == Enum.KeyCode.Space then
+				preview.paused = not preview.paused
+			elseif input.KeyCode == Enum.KeyCode.Left then
+				stepMs(-10)
+			elseif input.KeyCode == Enum.KeyCode.Right then
+				stepMs(10)
+			end
+		end)
+
+		globalConnections[#globalConnections + 1] = RunService.RenderStepped:Connect(function(dt)
+			if not screenGui.Enabled then
+				return
+			end
+
+			if rowsDirty and os.clock() - lastRowRefresh > 0.25 then
+				lastRowRefresh = os.clock()
+				refreshRows()
+			end
+
+			ui.playButton.Text = (preview and preview.paused) and "Play" or "Pause"
+
+			if not preview then
+				ui.fill.Size = UDim2.new(0, 0, 1, 0)
+				ui.playhead.Position = UDim2.new(0, 0, 0, 0)
+				ui.timeLabel.Text = "0 ms / 0 ms"
+				return
+			end
+
+			if dragging then
+				seekFromMouse()
+			elseif not preview.paused then
+				preview.elapsed = preview.elapsed + dt
+				if preview.elapsed >= preview.total then
+					preview.elapsed = 0
+				end
+			end
+
+			local sound = preview.sound
+			if sound then
+				local position = math.clamp(preview.elapsed, 0, math.max(preview.total - 0.001, 0))
+				if preview.paused or dragging then
+					if sound.IsPlaying then
+						sound:Pause()
+					end
+					pcall(function()
+						sound.TimePosition = position
+					end)
+				elseif not sound.IsPlaying then
+					pcall(function()
+						sound.TimePosition = position
+					end)
+					sound:Play()
+				elseif math.abs(sound.TimePosition - position) > 0.12 then
+					pcall(function()
+						sound.TimePosition = position
+					end)
+				end
+			else
+				local entry = preview.entry
+				ui.previewMsg.Text = string.format(
+					"EFFECT  %s\nowner: %s  |  seen x%d\n%s",
+					entry.key,
+					entry.entityName or "?",
+					entry.count,
+					entry.info ~= "" and ("data: " .. entry.info) or "(no data)"
+				)
+			end
+
+			local frac = math.clamp(preview.elapsed / preview.total, 0, 1)
+			ui.fill.Size = UDim2.new(frac, 0, 1, 0)
+			ui.playhead.Position = UDim2.new(frac, -1, 0, 0)
+			ui.timeLabel.Text = string.format(
+				"%d ms / %d ms",
+				math.floor(preview.elapsed * 1000 + 0.5),
+				math.floor(preview.total * 1000 + 0.5)
+			)
+		end)
+
+		showMessage(cfg.waiting)
+		refreshInfo()
+	end
+
+	-----------------------------------------------------------------------
+	-- Public API
+	-----------------------------------------------------------------------
+	function api.clear()
+		clearPreview()
+		loadToken = loadToken + 1
+		for _, entry in ipairs(entries) do
+			if entry.row then
+				entry.row:Destroy()
+			end
+		end
+		entries = {}
+		byKey = {}
+		selected = nil
+		holdStartMs = nil
+		if ui then
+			ui.countLabel.Text = "0 logged"
+			showMessage(cfg.waiting)
+			refreshInfo()
+			rebuildActionRows()
+			rebuildMarkers()
+		end
+	end
+
+	function api.open()
+		if not ui then
+			buildGui()
+		end
+		if not enabled then
+			local toggle = Toggles and Toggles[cfg.toggleKey]
+			if toggle then
+				toggle:SetValue(true)
+			else
+				api.setEnabled(true)
+			end
+		end
+		ui.screenGui.Enabled = true
+		rowsDirty = true
+		refreshRows()
+	end
+
+	function api.close()
+		if ui then
+			ui.screenGui.Enabled = false
+		end
+	end
+
+	function api.init() end
+
+	function api.detach()
+		api.setEnabled(false)
+		disconnectList(globalConnections)
+		clearPreview()
+		if ui and ui.screenGui then
+			pcall(function()
+				ui.screenGui:Destroy()
+			end)
+		end
+		ui = nil
+		entries = {}
+		byKey = {}
+		selected = nil
+	end
+
+	return api
+end
+
+return create
+end)
+__bundle_register("Features/Game/SoundLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
+return require("Features/Game/TimingLogger")("Sound")
+end)
+__bundle_register("Features/Game/EffectLogger", function(require, _LOADED, __bundle_register, __bundle_modules)
+return require("Features/Game/TimingLogger")("Effect")
+end)
 __bundle_register("Menu/ExploitTab", function(require, _LOADED, __bundle_register, __bundle_modules)
 local ExploitTab = {}
 local Icons = require("GUI/Icons")
@@ -83099,6 +84791,68 @@ end,
 })
 groupbox:AddButton("Open Animation Logger", function()
 AnimationLogger.open()
+end)
+local SoundLogger = require("Features/Game/SoundLogger")
+groupbox:AddDivider()
+groupbox:AddToggle("SoundLoggerEnabled", {
+Text = "Live Sound Logger",
+Tooltip = "Captures sounds played near you so you can preview them and assign actions in the Sound Logger window.",
+Default = false,
+Callback = function(value)
+SoundLogger.setEnabled(value)
+end,
+})
+groupbox:AddToggle("SoundLoggerIncludeSelf", {
+Text = "Log My Own Sounds",
+Default = false,
+Callback = function(value)
+SoundLogger.setIncludeSelf(value)
+end,
+})
+groupbox:AddSlider("SoundLoggerRange", {
+Text = "Sound Logger Range",
+Default = 100,
+Min = 10,
+Max = 500,
+Suffix = " studs",
+Rounding = 0,
+Callback = function(value)
+SoundLogger.setRange(value)
+end,
+})
+groupbox:AddButton("Open Sound Logger", function()
+SoundLogger.open()
+end)
+local EffectLogger = require("Features/Game/EffectLogger")
+groupbox:AddDivider()
+groupbox:AddToggle("EffectLoggerEnabled", {
+Text = "Live Effect Logger",
+Tooltip = "Captures effects fired by nearby players and mobs so you can assign actions in the Effect Logger window.",
+Default = false,
+Callback = function(value)
+EffectLogger.setEnabled(value)
+end,
+})
+groupbox:AddToggle("EffectLoggerIncludeSelf", {
+Text = "Log My Own Effects",
+Default = false,
+Callback = function(value)
+EffectLogger.setIncludeSelf(value)
+end,
+})
+groupbox:AddSlider("EffectLoggerRange", {
+Text = "Effect Logger Range",
+Default = 100,
+Min = 10,
+Max = 500,
+Suffix = " studs",
+Rounding = 0,
+Callback = function(value)
+EffectLogger.setRange(value)
+end,
+})
+groupbox:AddButton("Open Effect Logger", function()
+EffectLogger.open()
 end)
 end
 function ExploitTab.initLocalCharacterExploitsSection(groupbox)
@@ -85261,6 +87015,16 @@ autoDefenseDepBox:AddToggle("AntiBreakerNotify", {
 Text = "AP Break Notifications",
 Default = false,
 Tooltip = "Notify when a nearby player is flagged as trying to AP-break you.",
+})
+autoDefenseDepBox:AddToggle("CancelOnTradeWin", {
+Text = "Cancel On Trade Win",
+Default = true,
+Tooltip = "When you hit an enemy during their attack before they hit you, their pending parry/dodge timings are cancelled. Hyper-armor moves are ignored.",
+})
+autoDefenseDepBox:AddToggle("AntiBreakerEscalation", {
+Text = "Anti-Breaker Escalation",
+Default = true,
+Tooltip = "After a player is caught breaking, their unverified burst-pattern animations are blocked more strictly for a few seconds. Verified real attacks and your AP timings are never affected.",
 })
 local blatantRollToggle = autoDefenseDepBox:AddToggle("BlatantRoll", {
 Text = "Blatant Roll",
