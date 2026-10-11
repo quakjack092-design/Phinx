@@ -81674,6 +81674,20 @@ local dragging = false
 local holdStartMs = nil
 local flipView = false
 
+-- Hitbox preview state ------------------------------------------------------
+local EXTRA_H = 80 -- extra window height (all of it goes to the 3D preview)
+local DEFAULT_YAW = math.rad(35)
+local DEFAULT_PITCH = math.rad(28)
+local MIN_PITCH = math.rad(3)
+local MAX_PITCH = math.rad(85)
+local ZOOM_MIN = 0.05 -- multiplier on the "fit everything" distance
+local ZOOM_MAX = 3
+local ZOOM_STEP = 0.85
+local view = { yaw = DEFAULT_YAW, pitch = DEFAULT_PITCH, zoom = 1, center = nil, radius = 10 }
+local liveHitbox = nil -- hitbox typed in the box but not committed yet
+local orbiting = false
+local hitboxErrorShown = false
+
 ---------------------------------------------------------------------------
 -- Helpers
 ---------------------------------------------------------------------------
@@ -82258,6 +82272,7 @@ local function clearPreview()
 	end
 	preview = nil
 	if ui then
+		ui.hitboxCache = nil
 		for _, child in ipairs(ui.world:GetChildren()) do
 			child:Destroy()
 		end
@@ -82292,11 +82307,250 @@ local function cloneRig(model)
 	return clone
 end
 
-local function positionCamera(clone, root)
-	local _, size = clone:GetBoundingBox()
-	local dist = math.max(size.Magnitude * 1.1, 4)
-	local side = flipView and 1 or -1
-	ui.camera.CFrame = CFrame.lookAt(root.Position + Vector3.new(0, size.Y * 0.1, side * dist), root.Position)
+---------------------------------------------------------------------------
+-- Hitbox preview: lit baseplate, live hitbox box, orbit / zoom camera
+---------------------------------------------------------------------------
+local HITBOX_COLOR = Color3.fromRGB(60, 255, 140)
+local GROUND_COLOR = Color3.fromRGB(92, 100, 114)
+local GRID_COLOR = Color3.fromRGB(165, 175, 190)
+local GRID_MAJOR_COLOR = Color3.fromRGB(235, 240, 250)
+local GRID_HALF = 100 -- studs from the middle of the baseplate to its grid edge
+local GRID_STEP = 5
+local GRID_MAJOR = 20
+local SIGNS = { -1, 1 }
+
+-- The preview uses the same face/side defaults a freshly saved timing gets (see saveDraft),
+-- so what you see is what ends up in the config.
+local hitboxFrameInfo = nil
+local function getHitboxFrameInfo()
+	if not hitboxFrameInfo then
+		hitboxFrameInfo = { face = true, side = 0 }
+		pcall(function()
+			local defaults = AnimationTiming.new()
+			if typeof(defaults.fhb) == "boolean" then
+				hitboxFrameInfo.face = defaults.fhb
+			end
+			if typeof(defaults.hso) == "number" then
+				hitboxFrameInfo.side = defaults.hso
+			end
+		end)
+	end
+	return hitboxFrameInfo
+end
+
+-- The hitbox being edited: what is typed in the box right now, else the draft's value.
+local function currentHitbox()
+	local size = liveHitbox
+	if not size and selected then
+		size = getDraft(selected).hitbox
+	end
+	size = size or Vector3.new(20, 20, 25)
+	return Vector3.new(math.max(size.X, 0.05), math.max(size.Y, 0.05), math.max(size.Z, 0.05))
+end
+
+-- Mirrors Defender.hitbox: a box centred on the attacker's root, pushed forward by half its length.
+local function hitboxCFrame(rootCFrame, size)
+	local info = getHitboxFrameInfo()
+	local cframe = rootCFrame
+	if info.face then
+		cframe = cframe * CFrame.new(0, 0, -(size.Z / 2))
+	end
+	if info.side ~= 0 then
+		cframe = cframe * CFrame.new(0, 0, info.side)
+	end
+	return cframe
+end
+
+-- Actions that carry their own hitbox (different from the timing's) are not changed by the hitbox box.
+local function customHitboxCount()
+	if not selected then
+		return 0
+	end
+	local draft = getDraft(selected)
+	local count = 0
+	for _, act in ipairs(draft.actions) do
+		if act.hb and act.hb ~= draft.hitbox then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+local function refreshHud()
+	if not ui or not ui.hudInfo then
+		return
+	end
+	local size = currentHitbox()
+	local text = string.format("hitbox %g x %g x %g   (X wide, Y tall, Z long)\nzoom %.1fx", size.X, size.Y, size.Z, 1 / view.zoom)
+	local custom = customHitboxCount()
+	if custom > 0 then
+		text = text .. string.format("   %d action(s) keep their own hitbox", custom)
+	end
+	ui.hudInfo.Text = text
+end
+
+local function newStagePart(props, parent)
+	props.Anchored = true
+	props.CanCollide = false
+	props.CanQuery = false
+	props.CanTouch = false
+	props.CastShadow = false
+	return make("Part", props, parent)
+end
+
+-- Baseplate + grid (every 5 studs, brighter every 20) and the hitbox box. Lives directly in the
+-- ViewportFrame (not in the WorldModel) so clearing the rig never touches it.
+local function buildStage(viewport)
+	local stage = make("Model", { Name = "Stage" }, viewport)
+	local base = newStagePart({
+		Name = "Baseplate",
+		Size = Vector3.new(GRID_HALF * 2 + 20, 1, GRID_HALF * 2 + 20),
+		Position = Vector3.new(0, -0.5, 0),
+		Color = GROUND_COLOR,
+		Material = Enum.Material.SmoothPlastic,
+		Transparency = 0.25, -- slightly see-through so the part of the box below the feet is still visible
+	}, stage)
+	stage.PrimaryPart = base
+	for at = -GRID_HALF, GRID_HALF, GRID_STEP do
+		local major = at % GRID_MAJOR == 0
+		local thickness = major and 0.18 or 0.08
+		local color = major and GRID_MAJOR_COLOR or GRID_COLOR
+		newStagePart({
+			Name = "GridX",
+			Size = Vector3.new(GRID_HALF * 2, 0.06, thickness),
+			Position = Vector3.new(0, 0.05, at),
+			Color = color,
+			Material = Enum.Material.SmoothPlastic,
+		}, stage)
+		newStagePart({
+			Name = "GridZ",
+			Size = Vector3.new(thickness, 0.06, GRID_HALF * 2),
+			Position = Vector3.new(at, 0.05, 0),
+			Color = color,
+			Material = Enum.Material.SmoothPlastic,
+		}, stage)
+	end
+
+	local hitboxModel = make("Model", { Name = "Hitbox" }, viewport)
+	local fill = newStagePart({
+		Name = "Fill",
+		Size = Vector3.new(1, 1, 1),
+		Color = HITBOX_COLOR,
+		Material = Enum.Material.SmoothPlastic,
+		Transparency = 0.78,
+	}, hitboxModel)
+	local edges = {}
+	for index = 1, 12 do
+		edges[index] = newStagePart({
+			Name = "Edge",
+			Size = Vector3.new(0.1, 0.1, 0.1),
+			Color = HITBOX_COLOR,
+			Material = Enum.Material.Neon,
+		}, hitboxModel)
+	end
+	return stage, fill, edges
+end
+
+local function placeStage(groundY)
+	if ui and ui.stage then
+		ui.stage:PivotTo(CFrame.new(0, groundY - 0.5, 0))
+	end
+end
+
+local function drawHitbox(cframe, size, thickness)
+	ui.hitboxFill.Size = size
+	ui.hitboxFill.CFrame = cframe
+	local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
+	local index = 0
+	local function edge(offset, edgeSize)
+		index = index + 1
+		local part = ui.hitboxEdges[index]
+		part.Size = edgeSize
+		part.CFrame = cframe * CFrame.new(offset)
+	end
+	for _, sy in ipairs(SIGNS) do
+		for _, sz in ipairs(SIGNS) do
+			edge(Vector3.new(0, sy * hy, sz * hz), Vector3.new(size.X + thickness, thickness, thickness))
+		end
+	end
+	for _, sx in ipairs(SIGNS) do
+		for _, sz in ipairs(SIGNS) do
+			edge(Vector3.new(sx * hx, 0, sz * hz), Vector3.new(thickness, size.Y + thickness, thickness))
+		end
+	end
+	for _, sx in ipairs(SIGNS) do
+		for _, sy in ipairs(SIGNS) do
+			edge(Vector3.new(sx * hx, sy * hy, 0), Vector3.new(thickness, thickness, size.Z + thickness))
+		end
+	end
+end
+
+-- Cheap enough to call every frame: only touches the parts when the size, root or zoom changed.
+local function updateHitboxVisual(force)
+	if not ui or not preview or not ui.hitboxFill then
+		return
+	end
+	local size = currentHitbox()
+	local cframe = hitboxCFrame(preview.root.CFrame, size)
+	local thickness = math.clamp((ui.camDist or 30) * 0.006, 0.03, 1)
+	local cache = ui.hitboxCache
+	if not force and cache and cache.size == size and cache.cframe == cframe and cache.thickness == thickness then
+		return
+	end
+	ui.hitboxCache = { size = size, cframe = cframe, thickness = thickness }
+	drawHitbox(cframe, size, thickness)
+	refreshHud()
+end
+
+local function applyCamera()
+	if not ui or not view.center then
+		return
+	end
+	local yaw = view.yaw + (flipView and math.pi or 0)
+	local cosPitch = math.cos(view.pitch)
+	-- yaw 0 = in front of the attacker (they face -Z), like the old fixed camera
+	local direction = Vector3.new(math.sin(yaw) * cosPitch, math.sin(view.pitch), -math.cos(yaw) * cosPitch)
+	local fov = math.rad(ui.camera.FieldOfView)
+	local dist = math.max(view.radius / math.sin(fov / 2) * 1.1 * view.zoom, 0.5)
+	ui.camDist = dist
+	ui.camera.CFrame = CFrame.lookAt(view.center + direction * dist, view.center)
+	refreshHud()
+end
+
+-- Frames the rig and the hitbox together (smallest sphere that holds both), then points the camera.
+local function reframe()
+	if not ui or not preview then
+		return
+	end
+	local size = currentHitbox()
+	local boxCenter = hitboxCFrame(preview.root.CFrame, size).Position
+	local rigCenter, rigRadius = preview.rigCenter, preview.rigRadius
+	local boxRadius = size.Magnitude / 2
+	local apart = (boxCenter - rigCenter).Magnitude
+	local center, radius
+	if apart + boxRadius <= rigRadius then
+		center, radius = rigCenter, rigRadius
+	elseif apart + rigRadius <= boxRadius then
+		center, radius = boxCenter, boxRadius
+	else
+		radius = (apart + rigRadius + boxRadius) / 2
+		center = rigCenter + (boxCenter - rigCenter) / apart * (radius - rigRadius)
+	end
+	view.center = center
+	view.radius = math.max(radius, 2)
+	applyCamera()
+end
+
+local function zoomBy(factor)
+	view.zoom = math.clamp(view.zoom * factor, ZOOM_MIN, ZOOM_MAX)
+	applyCamera()
+end
+
+local function resetView()
+	view.yaw = DEFAULT_YAW
+	view.pitch = DEFAULT_PITCH
+	view.zoom = 1
+	applyCamera()
 end
 
 local function loadPreview(entry)
@@ -82329,7 +82583,9 @@ local function loadPreview(entry)
 		clone:PivotTo(CFrame.new(0, 0, 0))
 	end)
 	root.Anchored = true
-	positionCamera(clone, root)
+	-- Measure the rig before it animates, put the baseplate under its feet.
+	local rigCFrame, rigSize = clone:GetBoundingBox()
+	placeStage(rigCFrame.Position.Y - rigSize.Y / 2)
 
 	local animator = clone:FindFirstChildWhichIsA("Animator", true)
 	if not animator then
@@ -82375,9 +82631,13 @@ local function loadPreview(entry)
 			elapsed = 0,
 			paused = false,
 			note = fallbackNote,
+			rigCenter = rigCFrame.Position,
+			rigRadius = math.max(rigSize.Magnitude / 2, 2),
 		}
 		ui.viewport.Visible = true
 		ui.previewMsg.Visible = false
+		reframe()
+		updateHitboxVisual(true)
 		ui.rebuildMarkers()
 		ui.refreshInfo()
 	end)
@@ -82486,6 +82746,7 @@ local function rebuildActionRows()
 	if not ui then
 		return
 	end
+	refreshHud()
 	for _, child in ipairs(ui.actionList:GetChildren()) do
 		if child:IsA("Frame") then
 			child:Destroy()
@@ -82561,11 +82822,13 @@ local function refreshSettingsRow()
 	ui.tagButton.Text = draft.tag
 	ui.hitboxBox.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
 	ui.distBox.Text = tostring(draft.maxDist)
+	refreshHud()
 end
 
 function AnimationLogger.select(entry)
 	selected = entry
 	holdStartMs = nil
+	liveHitbox = nil
 	if ui then
 		ui.holdButton.Text = "Hold Block"
 	end
@@ -82641,8 +82904,8 @@ local function buildGui()
 		Name = "Outer",
 		BackgroundColor3 = Color3.new(0, 0, 0),
 		BorderSizePixel = 0,
-		Position = UDim2.new(0.5, -390, 0.5, -260),
-		Size = UDim2.new(0, 780, 0, 520),
+		Position = UDim2.new(0.5, -390, 0.5, -(260 + EXTRA_H / 2)),
+		Size = UDim2.new(0, 780, 0, 520 + EXTRA_H),
 		ZIndex = 2,
 	}, screenGui)
 
@@ -82722,18 +82985,56 @@ local function buildGui()
 	ui.info.TextWrapped = true
 	ui.info.TextYAlignment = Enum.TextYAlignment.Top
 
+	-- Brightly lit scene on a baseplate so the rig and the hitbox are easy to see.
 	ui.viewport = make("ViewportFrame", {
 		BorderSizePixel = 1,
 		Position = UDim2.new(0, 0, 0, 38),
-		Size = UDim2.new(1, 0, 0, 190),
+		Size = UDim2.new(1, 0, 0, 190 + EXTRA_H),
 		Visible = false,
-		Ambient = Color3.fromRGB(80, 80, 80),
-		LightColor = Color3.fromRGB(140, 134, 111),
+		Active = true,
+		BackgroundColor3 = Color3.fromRGB(30, 36, 48),
+		Ambient = Color3.fromRGB(125, 125, 135),
+		LightColor = Color3.fromRGB(235, 230, 215),
+		LightDirection = Vector3.new(-1, -2, -1.2),
 	}, right)
-	themeBox(ui.viewport)
+	ui.viewport.BorderColor3 = Library.OutlineColor
+	Library:AddToRegistry(ui.viewport, { BorderColor3 = "OutlineColor" }, true)
 	ui.world = make("WorldModel", {}, ui.viewport)
 	ui.camera = make("Camera", { CameraType = Enum.CameraType.Scriptable, FieldOfView = 70 }, ui.viewport)
 	ui.viewport.CurrentCamera = ui.camera
+	ui.stage, ui.hitboxFill, ui.hitboxEdges = buildStage(ui.viewport)
+
+	-- Overlay: hitbox readout, zoom buttons, controls hint
+	ui.hudInfo = make("TextLabel", {
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.45,
+		BorderSizePixel = 0,
+		FontFace = FONT,
+		Text = "",
+		TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Position = UDim2.new(0, 4, 0, 4),
+		Size = UDim2.new(0, 360, 0, 30),
+		ZIndex = 10,
+	}, ui.viewport)
+	local function hudButton(text, xFromRight, width, callback)
+		local button = newButton(ui.viewport, text, UDim2.new(1, -xFromRight, 0, 4), UDim2.new(0, width, 0, 20), callback)
+		button.ZIndex = 10
+		return button
+	end
+	hudButton("Reset", 56, 52, resetView)
+	hudButton("+", 84, 24, function()
+		zoomBy(ZOOM_STEP)
+	end)
+	hudButton("-", 112, 24, function()
+		zoomBy(1 / ZOOM_STEP)
+	end)
+	local hint = newLabel(ui.viewport, "mouse wheel = zoom    drag = orbit", UDim2.new(0, 6, 1, -18), UDim2.new(0, 300, 0, 16), 10)
+	hint.TextColor3 = Color3.fromRGB(215, 220, 230)
+	hint.TextStrokeTransparency = 0.4
+	hint.ZIndex = 10
 
 	ui.previewMsg = make("TextLabel", {
 		FontFace = FONT,
@@ -82742,7 +83043,7 @@ local function buildGui()
 		TextWrapped = true,
 		BorderSizePixel = 1,
 		Position = UDim2.new(0, 0, 0, 38),
-		Size = UDim2.new(1, 0, 0, 190),
+		Size = UDim2.new(1, 0, 0, 190 + EXTRA_H),
 	}, right)
 	themeBox(ui.previewMsg)
 	themeText(ui.previewMsg)
@@ -82750,7 +83051,7 @@ local function buildGui()
 	-- Timeline ----------------------------------------------------------------
 	ui.timeline = make("Frame", {
 		BorderSizePixel = 1,
-		Position = UDim2.new(0, 0, 0, 234),
+		Position = UDim2.new(0, 0, 0, 234 + EXTRA_H),
 		Size = UDim2.new(1, 0, 0, 26),
 	}, right)
 	themeBox(ui.timeline)
@@ -82776,7 +83077,7 @@ local function buildGui()
 	themeText(ui.timeLabel)
 
 	-- Transport -----------------------------------------------------------------
-	local y = 266
+	local y = 266 + EXTRA_H
 	ui.playButton = newButton(right, "Pause", UDim2.new(0, 0, 0, y), UDim2.new(0, 70, 0, 22), function()
 		if preview then
 			preview.paused = not preview.paused
@@ -82796,14 +83097,12 @@ local function buildGui()
 	end)
 	newButton(right, "Flip view", UDim2.new(0, 302, 0, y), UDim2.new(0, 74, 0, 22), function()
 		flipView = not flipView
-		if preview then
-			positionCamera(preview.clone, preview.root)
-		end
+		applyCamera()
 	end)
 	newLabel(right, "Space = pause   Left/Right = step 10ms", UDim2.new(0, 382, 0, y), UDim2.new(1, -382, 0, 22), 10)
 
 	-- Action palette --------------------------------------------------------------
-	y = 294
+	y = 294 + EXTRA_H
 	local palette = { "Parry", "Dodge", "Forced Full Dodge", "Start Block", "End Block", "Jump" }
 	local labels = { "Parry", "Dodge", "Full Dodge", "Start Block", "End Block", "Jump" }
 	local width = 70
@@ -82826,7 +83125,7 @@ local function buildGui()
 	-- Action list ---------------------------------------------------------------------
 	ui.actionList = make("ScrollingFrame", {
 		BorderSizePixel = 1,
-		Position = UDim2.new(0, 0, 0, 322),
+		Position = UDim2.new(0, 0, 0, 322 + EXTRA_H),
 		Size = UDim2.new(1, 0, 0, 92),
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -82837,7 +83136,7 @@ local function buildGui()
 	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 0) }, ui.actionList)
 
 	-- Settings row ----------------------------------------------------------------------
-	y = 420
+	y = 420 + EXTRA_H
 	ui.nameBox = newTextBox(right, "", UDim2.new(0, 0, 0, y), UDim2.new(0, 200, 0, 22), function(box)
 		if selected then
 			getDraft(selected).name = box.Text
@@ -82855,10 +83154,35 @@ local function buildGui()
 	end)
 	newLabel(right, "hitbox", UDim2.new(0, 286, 0, y), UDim2.new(0, 42, 0, 22), 11)
 	ui.hitboxBox = newTextBox(right, "20, 20, 25", UDim2.new(0, 328, 0, y), UDim2.new(0, 96, 0, 22), function(box)
+		liveHitbox = nil
 		if selected then
 			local draft = getDraft(selected)
+			local previous = draft.hitbox
 			draft.hitbox = parseVector(box.Text, draft.hitbox)
 			box.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
+			if draft.hitbox ~= previous then
+				-- Actions that were still using the old hitbox follow the new one (saveDraft stores
+				-- act.hb per action, so they would otherwise keep the old size when you save).
+				for _, act in ipairs(draft.actions) do
+					if act.hb == previous then
+						act.hb = nil
+					end
+				end
+			end
+			reframe()
+			updateHitboxVisual(true)
+			refreshHud()
+		end
+	end)
+	-- Live preview while typing: shows the box as soon as the text holds a valid size.
+	ui.hitboxBox:GetPropertyChangedSignal("Text"):Connect(function()
+		if not selected or not ui.hitboxBox:IsFocused() then
+			return
+		end
+		local typed = parseVector(ui.hitboxBox.Text, nil)
+		if typed then
+			liveHitbox = typed
+			reframe()
 		end
 	end)
 	newLabel(right, "max dist", UDim2.new(0, 430, 0, y), UDim2.new(0, 52, 0, 22), 11)
@@ -82871,7 +83195,7 @@ local function buildGui()
 	end)
 
 	-- Save row ----------------------------------------------------------------------------
-	y = 448
+	y = 448 + EXTRA_H
 	local saveButton = newButton(right, "Save To Script", UDim2.new(0, 0, 0, y), UDim2.new(0, 170, 0, 26), function()
 		if selected then
 			saveDraft(selected)
@@ -82892,6 +83216,7 @@ local function buildGui()
 			refreshSettingsRow()
 			rebuildActionRows()
 			rebuildMarkers()
+			reframe()
 		end
 	end)
 	newButton(right, "Clear Actions", UDim2.new(0, 292, 0, y), UDim2.new(0, 110, 0, 26), function()
@@ -82933,6 +83258,38 @@ local function buildGui()
 	globalConnections[#globalConnections + 1] = UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = false
+			orbiting = false
+		end
+	end)
+
+	-- 3D view controls: drag to orbit, mouse wheel (over the view) to zoom -------------------
+	ui.viewport.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			orbiting = true
+		end
+	end)
+
+	local mouse = Players.LocalPlayer:GetMouse()
+	local function mouseOverViewport()
+		if not ui.viewport.Visible then
+			return false
+		end
+		local pos, size = ui.viewport.AbsolutePosition, ui.viewport.AbsoluteSize
+		return mouse.X >= pos.X and mouse.X <= pos.X + size.X and mouse.Y >= pos.Y and mouse.Y <= pos.Y + size.Y
+	end
+
+	globalConnections[#globalConnections + 1] = UserInputService.InputChanged:Connect(function(input)
+		if not screenGui.Enabled then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseWheel then
+			if mouseOverViewport() then
+				zoomBy(input.Position.Z > 0 and ZOOM_STEP or 1 / ZOOM_STEP)
+			end
+		elseif orbiting and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			view.yaw = view.yaw + input.Delta.X * 0.01
+			view.pitch = math.clamp(view.pitch + input.Delta.Y * 0.01, MIN_PITCH, MAX_PITCH)
+			applyCamera()
 		end
 	end)
 
@@ -82992,6 +83349,12 @@ local function buildGui()
 			tp,
 			preview.length
 		)
+
+		local drawn, drawError = pcall(updateHitboxVisual)
+		if not drawn and not hitboxErrorShown then
+			hitboxErrorShown = true
+			notify("Animation Logger: hitbox preview error (%s).", tostring(drawError))
+		end
 	end)
 
 	showPreviewMessage("Waiting for an animation...")
