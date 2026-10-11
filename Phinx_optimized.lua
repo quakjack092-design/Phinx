@@ -68230,6 +68230,7 @@ end
 return Random.new():NextNumber(1.0, 100.0) <= reactRate
 end
 local MAX_ANIMATIONS_PER_SECOND = 50
+local NEAR_CAP_EXEMPT_DISTANCE = 60
 local animationProcessWindowStart = os.clock()
 local animationProcessCount = 0
 local function underAnimationProcessCap()
@@ -68441,6 +68442,9 @@ end
 return self:fpc(timing, hoptions) and true or false
 end
 if evaluate() then
+if self._feintedTrack == self.track then
+return false
+end
 return true
 end
 local graceMs = tonumber(Configuration.expectOptionValue("DynamicHitboxGrace")) or 0
@@ -68452,7 +68456,7 @@ local startedAt = os.clock()
 local deadline = startedAt + graceMs / 1000
 hoptions.hmid = self:uid(10)
 while os.clock() < deadline do
-task.wait(0.025)
+task.wait()
 if self.track ~= watchedTrack or not self.entity or not root.Parent then
 break
 end
@@ -68460,6 +68464,9 @@ if self:stopped(watchedTrack, timing, false) then
 break
 end
 if evaluate() then
+if self._feintedTrack == watchedTrack then
+return false
+end
 self:notify(timing, "Dynamic hitbox: target entered range after %.0fms.", (os.clock() - startedAt) * 1000)
 return true
 end
@@ -70709,7 +70716,8 @@ end
 if not timing then
 return
 end
-if not underAnimationProcessCap() then
+local nearDistance = self:distance(self.entity)
+if not (nearDistance and nearDistance <= NEAR_CAP_EXEMPT_DISTANCE) and not underAnimationProcessCap() then
 return
 end
 if not Configuration.expectToggleValue("EnableAutoDefense") then
@@ -70818,9 +70826,20 @@ function AnimatorDefender:_cancelFeintedTrack(reason, expectedTrack)
 if
 not self.track
 or (expectedTrack and expectedTrack ~= self.track)
-or tick() - (self._trackPlayedAt or 0) < FEINT_CUE_GRACE_PERIOD
 or (self.timing and self.timing.tag == "Mantra")
 then
+return
+end
+local sincePlayed = tick() - (self._trackPlayedAt or 0)
+if sincePlayed < FEINT_CUE_GRACE_PERIOD then
+-- Early cue (typical for weapon feints): defer instead of dropping it, so the feint is still honoured.
+local pendingTrack = self.track
+task.delay(FEINT_CUE_GRACE_PERIOD - sincePlayed + 0.01, function()
+if self.track ~= pendingTrack or self._feintedTrack == pendingTrack then
+return
+end
+self:_cancelFeintedTrack(reason, pendingTrack)
+end)
 return
 end
 if LPH_OBFUSCATED then
