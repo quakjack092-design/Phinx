@@ -107,6 +107,7 @@ end)
 __bundle_register("Lycoris", function(require, _LOADED, __bundle_register, __bundle_modules)
 local Lycoris = { queued = false, silent = false, dpscanning = false, norpc = false, verbose = false }
 local Logger = require("Utility/Logger")
+local Profiler = require("Utility/Profiler")
 local Environment = require("Utility/Environment")
 local Hooking = require("Game/Hooking")
 local Menu = require("Menu")
@@ -160,8 +161,8 @@ if game.PlaceId == CHIME_LOBBY_PLACE_ID then
 return Logger.warn("Script has initialized in the Chime lobby.")
 end
 if game.PlaceId ~= LOBBY_PLACE_ID then
-KeyHandling.init()
-Hooking.init()
+Profiler.run("Init_KeyHandling", KeyHandling.init)
+Profiler.run("Init_Hooking", Hooking.init)
 end
 CoreGuiManager.set()
 PersistentData.init()
@@ -188,14 +189,19 @@ end
 if game.PlaceId == LOBBY_PLACE_ID then
 return
 end
-QueuedBlocking.init()
-SaveManager.init()
-ModuleManager.refresh()
-ControlModule.init()
-Features.init()
-Menu.init()
-PlayerScanning.init()
-StateListener.init()
+-- Each start-up step is timed, and the game gets a frame between steps instead of one long stall.
+local function initStep(label, step)
+Profiler.run("Init_" .. label, step)
+task.wait()
+end
+initStep("QueuedBlocking", QueuedBlocking.init)
+initStep("SaveManager", SaveManager.init)
+initStep("ModuleManager", ModuleManager.refresh)
+initStep("ControlModule", ControlModule.init)
+initStep("Features", Features.init)
+initStep("Menu", Menu.init)
+initStep("PlayerScanning", PlayerScanning.init)
+initStep("StateListener", StateListener.init)
 if PersistentData.get("afdata") then
 task.spawn(function()
 local AutoFerryman = require("Features/Automation/AutoFerryman")
@@ -2863,11 +2869,11 @@ Registry = {},
 RegistryMap = {},
 OverrideData = {},
 HudRegistry = {},
-FontColor = Color3.fromRGB(240, 240, 240),
-MainColor = Color3.fromRGB(41, 41, 41),
-BackgroundColor = Color3.fromRGB(36, 36, 36),
-AccentColor = Color3.fromRGB(102, 57, 140),
-OutlineColor = Color3.fromRGB(20, 20, 20),
+FontColor = Color3.fromRGB(242, 232, 232),
+MainColor = Color3.fromRGB(29, 18, 20),
+BackgroundColor = Color3.fromRGB(18, 10, 12),
+AccentColor = Color3.fromRGB(226, 40, 62),
+OutlineColor = Color3.fromRGB(74, 28, 35),
 RiskColor = Color3.fromRGB(255, 50, 50),
 Black = Color3.new(0, 0, 0),
 Font = Font.fromEnum(Enum.Font.Code),
@@ -4774,6 +4780,13 @@ Library:AddToRegistry(ToggleInner, {
 BackgroundColor3 = "MainColor",
 BorderColor3 = "OutlineColor",
 })
+Library:Create("UICorner", { CornerRadius = UDim.new(0, 2), Parent = ToggleOuter })
+Library:Create("UICorner", { CornerRadius = UDim.new(0, 2), Parent = ToggleInner })
+Library:Create("UIGradient", {
+Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 188, 190)),
+Rotation = 90,
+Parent = ToggleInner,
+})
 local ToggleLabel = Library:CreateLabel({
 Size = UDim2.new(0, 216, 1, 0),
 Position = UDim2.new(1, 6, 0, 0),
@@ -4935,6 +4948,16 @@ Parent = SliderInner,
 Library:AddToRegistry(Fill, {
 BackgroundColor3 = "AccentColor",
 BorderColor3 = "AccentColorDark",
+})
+Library:Create("UIGradient", {
+Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(185, 170, 172)),
+Rotation = 90,
+Parent = Fill,
+})
+Library:Create("UIGradient", {
+Color = ColorSequence.new(Color3.fromRGB(235, 225, 226), Color3.new(1, 1, 1)),
+Rotation = 90,
+Parent = SliderInner,
 })
 local HideBorderRight = Library:Create("Frame", {
 BackgroundColor3 = Library.AccentColor,
@@ -5159,6 +5182,11 @@ Parent = DropdownOuter,
 Library:AddToRegistry(DropdownInner, {
 BackgroundColor3 = "MainColor",
 BorderColor3 = "OutlineColor",
+})
+Library:Create("UIGradient", {
+Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(205, 192, 194)),
+Rotation = 90,
+Parent = DropdownInner,
 })
 local DropdownArrow = Library:CreateLabel({
 AnchorPoint = Vector2.new(1, 0.5),
@@ -6329,6 +6357,35 @@ Parent = Inner,
 Library:AddToRegistry(WindowLabel, {
 TextColor3 = "FontColor",
 })
+do
+pcall(function()
+WindowLabel.TextSize = 17
+WindowLabel.FontFace = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Bold)
+end)
+Library:Create("UIGradient", {
+Color = ColorSequence.new(Color3.fromRGB(255, 244, 244), Color3.fromRGB(255, 120, 130)),
+Rotation = 90,
+Parent = WindowLabel,
+})
+local TitleRule = Library:Create("Frame", {
+AnchorPoint = Vector2.new(0.5, 0),
+BackgroundColor3 = Library.AccentColor,
+BorderSizePixel = 0,
+Position = UDim2.new(0.5, 0, 0, 26),
+Size = UDim2.new(1, -40, 0, 1),
+ZIndex = 3,
+Parent = Inner,
+})
+Library:AddToRegistry(TitleRule, { BackgroundColor3 = "AccentColor" })
+Library:Create("UIGradient", {
+Transparency = NumberSequence.new({
+NumberSequenceKeypoint.new(0, 1),
+NumberSequenceKeypoint.new(0.5, 0.15),
+NumberSequenceKeypoint.new(1, 1),
+}),
+Parent = TitleRule,
+})
+end
 if DragonAsset then
 local DragonLogo = Library:Create("ImageLabel", {
 BackgroundTransparency = 1,
@@ -6365,7 +6422,7 @@ Parent = Outer,
 })
 Library:AddToRegistry(WindowStroke, { Color = "AccentColor" })
 Library:Create("UIGradient", {
-Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 200, 212)),
+Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(205, 192, 194)),
 Rotation = 90,
 Parent = Inner,
 })
@@ -6736,8 +6793,16 @@ TextYAlignment = Enum.TextYAlignment.Center,
 ZIndex = 3,
 Parent = TabButton,
 })
+local function ActiveTabText()
+return Library.AccentColor:Lerp(Color3.new(1, 1, 1), 0.45)
+end
+TabButtonLabel.Text = string.upper(Name)
+TabButtonLabel.TextSize = 13
+pcall(function()
+TabButtonLabel.FontFace = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.SemiBold)
+end)
 Library.RegistryMap[TabButtonLabel].Properties.TextColor3 = function()
-return TabActive and Library.FontColor or Library.GetTabInactiveText()
+return TabActive and ActiveTabText() or Library.GetTabInactiveText()
 end
 local TabIcon = nil
 local tabIconIndex = TAB_ICON_INDEX[Name]
@@ -6774,11 +6839,11 @@ Library:AddToRegistry(TabIcon, {
 ImageColor3 = "FontColor",
 })
 Library.RegistryMap[TabIcon].Properties.ImageColor3 = function()
-return TabActive and Library.FontColor or Library.GetTabInactiveText()
+return TabActive and ActiveTabText() or Library.GetTabInactiveText()
 end
 end
 Library:Create("UIGradient", {
-Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(185, 185, 195)),
+Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(190, 176, 178)),
 Rotation = 90,
 Parent = TabButton,
 })
@@ -6799,9 +6864,9 @@ Size = UDim2.new(width, 0, 0, 2),
 end
 TabButton.MouseEnter:Connect(function()
 if not TabActive then
-TabButtonLabel.TextColor3 = Library.FontColor
+TabButtonLabel.TextColor3 = ActiveTabText()
 if TabIcon then
-TabIcon.ImageColor3 = Library.FontColor
+TabIcon.ImageColor3 = ActiveTabText()
 end
 tweenUnderline(0.3)
 end
@@ -6876,9 +6941,9 @@ end
 TabActive = true
 TabButton.BackgroundColor3 = Library.GetTabActiveColor()
 Library.RegistryMap[TabButton].Properties.BackgroundColor3 = Library.GetTabActiveColor
-TabButtonLabel.TextColor3 = Library.FontColor
+TabButtonLabel.TextColor3 = ActiveTabText()
 if TabIcon then
-TabIcon.ImageColor3 = Library.FontColor
+TabIcon.ImageColor3 = ActiveTabText()
 end
 tweenUnderline(1)
 TabFrame.Visible = true
@@ -6942,19 +7007,26 @@ NumberSequenceKeypoint.new(1, 0.85),
 Parent = Highlight,
 })
 Library:Create("UIGradient", {
-Color = ColorSequence.new(Color3.fromRGB(235, 235, 242), Color3.fromRGB(205, 205, 215)),
+Color = ColorSequence.new(Color3.fromRGB(242, 232, 233), Color3.fromRGB(212, 198, 200)),
 Rotation = 90,
 Parent = BoxInner,
 })
 local GroupboxLabel = Library:CreateLabel({
 Size = UDim2.new(1, 0, 0, 18),
-Position = UDim2.new(0, 6, 0, 2),
-TextSize = 12,
-Text = Info.Name,
-TextXAlignment = Enum.TextXAlignment.Left,
+Position = UDim2.new(0, 0, 0, 2),
+TextSize = 13,
+Text = string.upper(Info.Name),
+TextColor3 = Library.AccentColor,
+TextXAlignment = Enum.TextXAlignment.Center,
 ZIndex = 5,
 Parent = BoxInner,
 })
+pcall(function()
+GroupboxLabel.FontFace = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.SemiBold)
+end)
+if Library.RegistryMap[GroupboxLabel] then
+Library.RegistryMap[GroupboxLabel].Properties.TextColor3 = "AccentColor"
+end
 local Container = Library:Create("Frame", {
 BackgroundTransparency = 1,
 Position = UDim2.new(0, 4, 0, 20),
@@ -72701,6 +72773,7 @@ end)()
 end)
 __bundle_register("Features", function(require, _LOADED, __bundle_register, __bundle_modules)
 local Features = {}
+local Profiler = require("Utility/Profiler")
 local CharismaFarm = require("Features/Automation/CharismaFarm")
 local IntelligenceFarm = require("Features/Automation/InteligenceFarm")
 local Movement = require("Features/Game/Movement")
@@ -72726,26 +72799,31 @@ local OptimizeGame = require("Features/Game/OptimizeGame")
 local FakeVoid = require("Features/Game/FakeVoid")
 local RevealAnimations = require("Features/Game/RevealAnimations")()
 function Features.init()
-Defense.init()
-ExpApBreaker.init()
-Visuals.init()
-Movement.init()
-Monitoring.init()
-Removal.init()
-Exploits.init()
-Spoofing.init()
-OwnershipWatcher.init()
-CharismaFarm.init()
-IntelligenceFarm.init()
-FishFarm.init()
-Teleport.init()
-AutoLoot.init()
-AntiAFK.init()
-OptimizeGame.init()
-FakeVoid.init()
-RevealAnimations.init()
+-- Each feature is timed, and the game gets a frame between features instead of one long stall.
+local function initFeature(label, init)
+Profiler.run("Init_Feature_" .. label, init)
+task.wait()
+end
+initFeature("Defense", Defense.init)
+initFeature("ExpApBreaker", ExpApBreaker.init)
+initFeature("Visuals", Visuals.init)
+initFeature("Movement", Movement.init)
+initFeature("Monitoring", Monitoring.init)
+initFeature("Removal", Removal.init)
+initFeature("Exploits", Exploits.init)
+initFeature("Spoofing", Spoofing.init)
+initFeature("OwnershipWatcher", OwnershipWatcher.init)
+initFeature("CharismaFarm", CharismaFarm.init)
+initFeature("IntelligenceFarm", IntelligenceFarm.init)
+initFeature("FishFarm", FishFarm.init)
+initFeature("Teleport", Teleport.init)
+initFeature("AutoLoot", AutoLoot.init)
+initFeature("AntiAFK", AntiAFK.init)
+initFeature("OptimizeGame", OptimizeGame.init)
+initFeature("FakeVoid", FakeVoid.init)
+initFeature("RevealAnimations", RevealAnimations.init)
 if not armorshield or armorshield.current_role == "builder" then
-AnimationVisualizer.init()
+initFeature("AnimationVisualizer", AnimationVisualizer.init)
 end
 if not LPH_OBFUSCATED or shared.Lycoris.verbose then
 Logger.warn("Features initialized.")
@@ -73047,6 +73125,7 @@ local Signal = require("Utility/Signal")
 local Logger = require("Utility/Logger")
 local Configuration = require("Utility/Configuration")
 local Maid = require("Utility/Maid")
+local Profiler = require("Utility/Profiler")
 local optimizeGameMaid = Maid.new()
 local initialized = false
 local ranVisuals = false
@@ -73118,10 +73197,20 @@ end
 ranVisuals = true
 task.spawn(function()
 local count = 0
-for _, obj in next, game:GetDescendants() do
-downgradeObject(obj)
+local descendants = game:GetDescendants()
+local total = #descendants
+local index = 1
+while index <= total do
+-- Time-budgeted: about 1.5 ms of work per frame (was 1000 objects), each chunk timed by the profiler.
+Profiler.run("OptimizeGame_AggressiveChunk", function()
+local deadline = os.clock() + 0.0015
+repeat
+downgradeObject(descendants[index])
+index = index + 1
 count = count + 1
-if count % 1000 == 0 then
+until index > total or os.clock() >= deadline
+end)
+if index <= total then
 task.wait()
 end
 end
@@ -73259,6 +73348,36 @@ wasEnabled = enabled
 task.wait(0.25)
 end
 end)
+-- New instances are downgraded in small batches (250 per frame) instead of one deferred task each,
+-- so a burst of spawned parts/effects cannot land on a single frame.
+local downgradeQueue, queueFirst, queueLast, draining = {}, 1, 0, false
+local function drainDowngradeQueue()
+if draining then
+return
+end
+draining = true
+task.spawn(function()
+while queueFirst <= queueLast do
+Profiler.run("OptimizeGame_DowngradeBatch", function()
+local budget = 250
+while budget > 0 and queueFirst <= queueLast do
+local queued = downgradeQueue[queueFirst]
+downgradeQueue[queueFirst] = nil
+queueFirst = queueFirst + 1
+budget = budget - 1
+if queued and ranVisuals then
+pcall(downgradeObject, queued)
+end
+end
+end)
+if queueFirst <= queueLast then
+task.wait()
+end
+end
+queueFirst, queueLast = 1, 0
+draining = false
+end)
+end
 local descendantAddedSignal = Signal.new(game.DescendantAdded)
 optimizeGameMaid:add(descendantAddedSignal:connect("OptimizeGame_DescendantAdded", function(obj)
 if ranVisuals and (
@@ -73277,7 +73396,9 @@ or obj:IsA("PointLight")
 or obj:IsA("SpotLight")
 or obj:IsA("SurfaceLight")
 ) then
-task.defer(downgradeObject, obj)
+queueLast = queueLast + 1
+downgradeQueue[queueLast] = obj
+drainDowngradeQueue()
 end
 end))
 if not LPH_OBFUSCATED or shared.Lycoris.verbose then
@@ -77855,11 +77976,23 @@ end
 if child:GetAttribute("Rarity") and child:IsA("MeshPart") then
 return emplaceObject(child, PartESP.new("VOIWeaponESP", child, child.Name))
 end
-visualsMaid:mark(TaskSpawner.spawn("Visuals_BRWeaponCheck", function()
-if child:IsA("MeshPart") and child:WaitForChild("InteractPrompt", 0.1) and not name:match("Barrel") then
+if not child:IsA("MeshPart") then
+return
+end
+local weaponThread = TaskSpawner.spawn("Visuals_BRWeaponCheck", function()
+if child:WaitForChild("InteractPrompt", 0.1) and not name:match("Barrel") then
 return emplaceObject(child, PartESP.new("BRWeapon", child, name))
 end
-end))
+end)
+if coroutine.status(weaponThread) ~= "dead" then
+-- Only keep the thread while it is still waiting; the old code stored every one forever (unbounded growth).
+local weaponTaskId = visualsMaid:add(weaponThread)
+task.delay(0.25, function()
+if visualsMaid[weaponTaskId] == weaponThread then
+visualsMaid:removeTask(weaponTaskId)
+end
+end)
+end
 end)
 local onTerrainChildAdded = LPH_NO_VIRTUALIZE(function(child)
 if child.Name ~= "Attachment" and not child:IsA("Attachment") then
@@ -81520,6 +81653,12 @@ do
 ThemeManager.Folder = "Lycoris-Rewrite-Themes"
 ThemeManager.Library = nil
 ThemeManager.BuiltInThemes = {
+["Crimson"] = {
+0,
+httpService:JSONDecode(
+'{"FontColor":"f2e8e8","MainColor":"1d1214","AccentColor":"e2283e","BackgroundColor":"120a0c","OutlineColor":"4a1c23"}'
+),
+},
 ["Default"] = {
 1,
 httpService:JSONDecode(
@@ -81615,7 +81754,7 @@ self.Library.AccentColorDark = self.Library:GetDarkerColor(self.Library.AccentCo
 self.Library:UpdateColorsUsingRegistry()
 end
 function ThemeManager:LoadDefault()
-local theme = "Default"
+local theme = "Crimson"
 local content = isfile(self.Folder .. "/default.txt") and readfile(self.Folder .. "/default.txt")
 local isDefault = true
 if content then
