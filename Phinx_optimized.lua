@@ -8972,13 +8972,21 @@ local TaskSpawner = {}
 local Profiler = require("Utility/Profiler")
 local Logger = require("Utility/Logger")
 local RunService = game:GetService("RunService")
+local activeDelays = 0
+local MAX_ACTIVE_DELAYS = 400
 function TaskSpawner.delay(label, delay, callback, ...)
 local function onTaskFunctionError(error)
 Logger.trace("onTaskFunctionError - (%s) - %s", label, error)
 end
+if activeDelays >= MAX_ACTIVE_DELAYS then
+-- Safety valve: hundreds of simultaneous waiting threads means something is flooding; drop instead of piling up.
+return task.spawn(function() end)
+end
 local taskFunction = Profiler.wrap(
 label,
 LPH_NO_VIRTUALIZE(function(...)
+activeDelays = activeDelays + 1
+local waited, waitError = pcall(function()
 local timestamp = os.clock()
 local consistency = Toggles and Toggles.ParryConsistency
 if consistency and consistency.Value then
@@ -8990,6 +8998,11 @@ else
 while os.clock() - timestamp < delay() do
 RunService.RenderStepped:Wait()
 end
+end
+end)
+activeDelays = activeDelays - 1
+if not waited then
+return onTaskFunctionError(waitError)
 end
 return xpcall(callback, onTaskFunctionError, ...)
 end)
@@ -17095,7 +17108,7 @@ local RepeatInfo = require("Features/Combat/Objects/RepeatInfo")
 local Maid = require("Utility/Maid")
 local Signal = require("Utility/Signal")
 local Configuration = require("Utility/Configuration")
-local fs = Filesystem.new("Lycoris-Rewrite-Modules")
+local fs = Filesystem.new("Merit-Modules", "Lycoris-Rewrite-Modules")
 local gfs = Filesystem.new(fs:append("Globals"))
 local tdetach = {}
 function ModuleManager.execute(lf, id, file, global)
@@ -19259,7 +19272,10 @@ local Logger = require("Utility/Logger")
 local Deserializer = require("Utility/Deserializer")
 local String = require("Utility/String")
 local Serializer = require("Utility/Serializer")
-local fs = Filesystem.new("Lycoris-Rewrite-Timings")
+local fs = Filesystem.new("Merit-Timings", "Lycoris-Rewrite-Timings")
+-- Every timing a player builds is also written here as its own file, so it can be shared.
+local shareFs = Filesystem.new("Merit-ShareableTimings")
+local BUILDER_CONFIG_NAME = "AnimationLogger"
 local config = TimingSave.new()
 local runService = game:GetService("RunService")
 local saveMaid = Maid.new()
@@ -19308,6 +19324,37 @@ return out
 end
 function SaveManager.refresh(dropdown)
 dropdown:SetValues(SaveManager.list())
+end
+local function shareFileName(name)
+local clean = tostring(name or "timing"):gsub("[^%w%s%-%._%(%)]", "_")
+clean = clean:gsub("^%s+", ""):gsub("%s+$", "")
+if #clean <= 0 then
+clean = "timing"
+end
+return clean .. ".txt"
+end
+function SaveManager.exportTiming(kind, timing)
+local success, result = pcall(function()
+local single = TimingSave.new()
+local container = single:get()[kind]
+if not container then
+return error("unknown timing kind " .. tostring(kind))
+end
+container:push(timing:clone())
+shareFs:write(shareFileName(timing.name), Serializer.marshal(single:serialize()))
+end)
+if not success then
+Logger.warn("Timing manager failed to export timing '%s' for sharing: %s", tostring(timing and timing.name), tostring(result))
+end
+return success
+end
+function SaveManager.removeExport(timing)
+pcall(function()
+local file = shareFileName(timing.name)
+if shareFs:file(file) then
+shareFs:delete(file)
+end
+end)
 end
 function SaveManager.autoload(name)
 if not name or #name <= 0 then
@@ -19418,6 +19465,20 @@ os.clock() - timestamp
 )
 SaveManager.llc = config:clone()
 SaveManager.llcn = name
+if name == BUILDER_CONFIG_NAME then
+task.spawn(function()
+for _, kind in ipairs({ "animation", "sound", "effect" }) do
+local container = config:get()[kind]
+for _, timing in next, container and container.timings or {} do
+local file = shareFileName(timing.name)
+if not shareFs:file(file) then
+SaveManager.exportTiming(kind, timing)
+task.wait()
+end
+end
+end
+end)
+end
 end
 function SaveManager.autosave()
 if not SaveManager.llcn then
@@ -65511,9 +65572,36 @@ new[idx] = raw and path or string.sub(path, #(self:path() .. "\\") + 1, #path)
 end
 return new
 end
-function Filesystem.new(path)
+local function copyMissing(from, to)
+if not isfolder(to) then
+makefolder(to)
+end
+for _, entry in next, listfiles(from) do
+local name = tostring(entry):match("([^/\\]+)$")
+if name then
+local target = to .. "/" .. name
+if isfolder(entry) then
+copyMissing(entry, target)
+elseif isfile(entry) and not isfile(target) then
+writefile(target, readfile(entry))
+end
+end
+end
+end
+-- Copies the files of an old (Lycoris) folder into the new (Merit) one the first time, so nothing is lost.
+-- The old folder is left untouched.
+function Filesystem.migrate(legacy, current)
+if not legacy or not isfolder or not listfiles or not isfolder(legacy) or isfolder(current) then
+return false
+end
+return (pcall(copyMissing, legacy, current))
+end
+function Filesystem.new(path, legacyPath)
 local self = setmetatable({}, Filesystem)
 self._path = path
+if legacyPath then
+Filesystem.migrate(legacyPath, path)
+end
 return self
 end
 return Filesystem
@@ -65683,6 +65771,9 @@ end
 if typeof(values.rsaw) == "number" then
 self.rsaw = values.rsaw
 end
+if values.pmode == "enter" or values.pmode == "hitbox" then
+self.pmode = values.pmode
+end
 end
 function Timing:equals(other)
 if self.name ~= other.name then
@@ -65772,6 +65863,9 @@ end
 if self.rsaw ~= other.rsaw then
 return false
 end
+if self.pmode ~= other.pmode then
+return false
+end
 return true
 end
 function Timing:clone()
@@ -65805,6 +65899,7 @@ clone.uif = self.uif
 clone.rsc = self.rsc
 clone.rsaid = self.rsaid
 clone.rsaw = self.rsaw
+clone.pmode = self.pmode
 return clone
 end
 function Timing:serialize()
@@ -65844,6 +65939,7 @@ uif = self.uif,
 rsc = self.rsc,
 rsaid = self.rsaid,
 rsaw = self.rsaw,
+pmode = self.pmode,
 }
 end
 function Timing.new(values)
@@ -65877,6 +65973,7 @@ self.uif = false
 self.rsc = false
 self.rsaid = ""
 self.rsaw = 4.0
+self.pmode = "hitbox"
 if values then
 self:load(values)
 end
@@ -68476,6 +68573,10 @@ end
 return Random.new():NextNumber(1.0, 100.0) <= reactRate
 end
 local MAX_ANIMATIONS_PER_SECOND = 50
+-- Enemies this close are never dropped by the per-second animation cap.
+local NEAR_CAP_EXEMPT_DISTANCE = 60
+-- "When entered hitbox" timings keep checking every frame for up to this long after the action's time.
+local ENTER_HITBOX_MAX_WAIT = 1.0
 local animationProcessWindowStart = os.clock()
 local animationProcessCount = 0
 local function underAnimationProcessCap()
@@ -68690,7 +68791,11 @@ if evaluate() then
 return true
 end
 local graceMs = tonumber(Configuration.expectOptionValue("DynamicHitboxGrace")) or 0
-if timing.duih or not Configuration.expectToggleValue("DynamicHitbox") or graceMs <= 0 then
+local enterMode = timing.pmode == "enter" and not timing.duih
+if enterMode then
+-- Parry mode "When entered hitbox": act the moment the hitbox reaches you instead of failing at the timing.
+graceMs = ENTER_HITBOX_MAX_WAIT * 1000
+elseif timing.duih or not Configuration.expectToggleValue("DynamicHitbox") or graceMs <= 0 then
 return self:notify(timing, "Not in hitbox.")
 end
 local watchedTrack = self.track
@@ -68698,7 +68803,7 @@ local startedAt = os.clock()
 local deadline = startedAt + graceMs / 1000
 hoptions.hmid = self:uid(10)
 while os.clock() < deadline do
-task.wait(0.025)
+task.wait()
 if self.track ~= watchedTrack or not self.entity or not root.Parent then
 break
 end
@@ -70955,7 +71060,8 @@ end
 if not timing then
 return
 end
-if not underAnimationProcessCap() then
+local nearDistance = self:distance(self.entity)
+if not (nearDistance and nearDistance <= NEAR_CAP_EXEMPT_DISTANCE) and not underAnimationProcessCap() then
 return
 end
 if not Configuration.expectToggleValue("EnableAutoDefense") then
@@ -75727,10 +75833,10 @@ local buildUrl = string.format("https://deepwoken.co/builder?id=%s", decoded.id)
 setclipboard(buildUrl)
 local path = string.format("%s %s Stolen Build", os.date("%B %d %Y"), player.Name)
 Logger.notify("Successfully stole %s's build, %s & saved to file.", fetchName(player), buildUrl)
-if not isfolder("Lycoris/Stolen Builds") then
-makefolder("Lycoris/Stolen Builds")
+if not isfolder("Merit/Stolen Builds") then
+makefolder("Merit/Stolen Builds")
 end
-writefile("Lycoris/Stolen Builds/" .. path .. ".txt", string.format([[.gg/lyc
+writefile("Merit/Stolen Builds/" .. path .. ".txt", string.format([[.gg/lyc
 stolen on %s
 build url: %s
 %s]], os.date("%B %d %Y"), buildUrl, data.content.notes))
@@ -80328,10 +80434,10 @@ local players = game:GetService("Players")
 local userInputService = game:GetService("UserInputService")
 local renderStepped = Signal.new(runService.RenderStepped)
 local menuMaid = Maid.new()
-local MENU_TITLE = "Phinx | Deepwoken"
+local MENU_TITLE = "Merit | Deepwoken"
 if LRM_UserNote then
 MENU_TITLE = string.format(
-"Phinx | Deepwoken",
+"Merit | Deepwoken",
 string.sub("6c10af8d79e3dc253ba6db7f343613361c37e378", 1, 6)
 )
 end
@@ -80345,10 +80451,10 @@ MenuFadeTime = 0.0,
 Size = UDim2.fromOffset(560, 570),
 })
 ThemeManager:SetLibrary(Library)
-ThemeManager:SetFolder("Lycoris-Rewrite-Themes")
+ThemeManager:SetFolder("Merit-Themes")
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetFolder("Lycoris-Rewrite-Configs")
+SaveManager:SetFolder("Merit-Configs")
 SaveManager:SetIgnoreIndexes({
 "Fly",
 "NoClip",
@@ -80487,7 +80593,7 @@ delfile("smarker.txt")
 else
 writefile(
 "smarker.txt",
-"Hello, if you're reading this, that means you have Lycoris-Rewrite (Deepwoken) silent mode turned on. Deleting this file will turn it off."
+"Hello, if you're reading this, that means you have Merit (Deepwoken) silent mode turned on. Deleting this file will turn it off."
 )
 end
 end)
@@ -80506,7 +80612,7 @@ delfile("dpscanning.txt")
 else
 writefile(
 "dpscanning.txt",
-"Hello, if you're reading this, that means you have Lycoris-Rewrite (Deepwoken) player scanning turned off. Deleting this file will turn it on."
+"Hello, if you're reading this, that means you have Merit (Deepwoken) player scanning turned off. Deleting this file will turn it on."
 )
 end
 end)
@@ -80525,7 +80631,7 @@ delfile("norpc.txt")
 else
 writefile(
 "norpc.txt",
-"Hello, if you're reading this, that means you have Lycoris-Rewrite (Deepwoken) Bloxstrap RPC turned off. Deleting this file will turn it on."
+"Hello, if you're reading this, that means you have Merit (Deepwoken) Bloxstrap RPC turned off. Deleting this file will turn it on."
 )
 end
 end)
@@ -80544,7 +80650,7 @@ delfile("verbose.txt")
 else
 writefile(
 "verbose.txt",
-"Hello, if you're reading this, that means you have Lycoris-Rewrite (Deepwoken) debug logs turned on. Deleting this file will turn it off."
+"Hello, if you're reading this, that means you have Merit (Deepwoken) debug logs turned on. Deleting this file will turn it off."
 )
 end
 end)
@@ -80670,7 +80776,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Players = game:GetService("Players")
 local Mouse = Players.LocalPlayer:GetMouse()
-local artStorage = Filesystem.new("Lycoris/Spotify/Art")
+local artStorage = Filesystem.new("Merit/Spotify/Art")
 local artCache = {}
 local POLL_INTERVAL = 2
 local SpotifyWidget = {}
@@ -80997,7 +81103,7 @@ __bundle_register("Utility/SpotifyClient", function(require, _LOADED, __bundle_r
 local JSON = require("Utility/JSON")
 local Filesystem = require("Utility/Filesystem")
 local Logger = require("Utility/Logger")
-local storage = Filesystem.new("Lycoris/Spotify")
+local storage = Filesystem.new("Merit/Spotify", "Lycoris/Spotify")
 local DEBUG = false
 local function dbg(fmt, ...)
 if DEBUG then
@@ -81336,7 +81442,8 @@ return UDim2.new(serialized.xScale, serialized.xOffset, serialized.yScale, seria
 end
 local SaveManager = {}
 do
-SaveManager.Folder = "Lycoris-Rewrite-Configs"
+require("Utility/Filesystem").migrate("Lycoris-Rewrite-Configs", "Merit-Configs")
+SaveManager.Folder = "Merit-Configs"
 SaveManager.Ignore = {}
 SaveManager.Parser = {
 Toggle = {
@@ -81650,7 +81757,8 @@ return LPH_NO_VIRTUALIZE(function()
 local httpService = game:GetService("HttpService")
 local ThemeManager = {}
 do
-ThemeManager.Folder = "Lycoris-Rewrite-Themes"
+require("Utility/Filesystem").migrate("Lycoris-Rewrite-Themes", "Merit-Themes")
+ThemeManager.Folder = "Merit-Themes"
 ThemeManager.Library = nil
 ThemeManager.BuiltInThemes = {
 ["Crimson"] = {
@@ -81989,6 +82097,7 @@ local flipView = false
 
 -- Hitbox preview state ------------------------------------------------------
 local EXTRA_H = 80 -- extra window height (all of it goes to the 3D preview)
+local EXTRA_ROW = 28 -- extra window height for the parry mode row
 local DEFAULT_YAW = math.rad(35)
 local DEFAULT_PITCH = math.rad(28)
 local MIN_PITCH = math.rad(3)
@@ -82353,6 +82462,7 @@ end
 local function draftFromTiming(timing, entry)
 	local draft = {
 		name = timing.name or defaultName(entry),
+		pmode = timing.pmode == "enter" and "enter" or "hitbox",
 		tag = timing.tag or "Undefined",
 		maxDist = tonumber(timing.imxd) or 60,
 		hitbox = timing.hitbox or Vector3.new(20, 20, 25),
@@ -82377,6 +82487,7 @@ end
 local function newDraft(entry)
 	return {
 		name = defaultName(entry),
+		pmode = "hitbox",
 		tag = "Undefined",
 		maxDist = 60,
 		hitbox = Vector3.new(20, 20, 25),
@@ -82427,6 +82538,7 @@ local function saveDraft(entry)
 	timing._id = entry.aid
 	timing.name = uniqueTimingName(draft.name ~= "" and draft.name or defaultName(entry), entry.aid)
 	timing.tag = draft.tag
+	timing.pmode = draft.pmode == "enter" and "enter" or "hitbox"
 	timing.imdd = 0
 	timing.imxd = draft.maxDist
 	timing.hitbox = draft.hitbox
@@ -82462,6 +82574,10 @@ local function saveDraft(entry)
 	end
 
 	draft.name = timing.name
+	if previous and previous.name ~= timing.name then
+		SaveManager.removeExport(previous)
+	end
+	SaveManager.exportTiming("animation", timing)
 	if persist() then
 		notify("Animation Logger: saved '%s' to your timing config.", timing.name)
 	else
@@ -82478,6 +82594,7 @@ local function deleteSaved(entry)
 	end
 	container.timings[entry.aid] = nil
 	entry.draft = nil
+	SaveManager.removeExport(existing)
 	if ensureConfig() then
 		persist()
 	end
@@ -83126,6 +83243,20 @@ local function refreshInfo()
 	)
 end
 
+local PARRY_MODES = {
+	hitbox = { text = "Mode: Only In Hitbox", hint = "Acts at the timing only if you're in the hitbox. Best for static, 1-hit moves." },
+	enter = { text = "Mode: When Entered Hitbox", hint = "Acts as soon as you enter the hitbox. Best for moving moves." },
+}
+
+local function refreshModeRow()
+	if not ui or not ui.modeButton or not selected then
+		return
+	end
+	local mode = PARRY_MODES[getDraft(selected).pmode] or PARRY_MODES.hitbox
+	ui.modeButton.Text = mode.text
+	ui.modeHint.Text = mode.hint
+end
+
 local function refreshSettingsRow()
 	if not ui or not selected then
 		return
@@ -83133,6 +83264,7 @@ local function refreshSettingsRow()
 	local draft = getDraft(selected)
 	ui.nameBox.Text = draft.name
 	ui.tagButton.Text = draft.tag
+	refreshModeRow()
 	ui.hitboxBox.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
 	ui.distBox.Text = tostring(draft.maxDist)
 	refreshHud()
@@ -83217,8 +83349,8 @@ local function buildGui()
 		Name = "Outer",
 		BackgroundColor3 = Color3.new(0, 0, 0),
 		BorderSizePixel = 0,
-		Position = UDim2.new(0.5, -390, 0.5, -(260 + EXTRA_H / 2)),
-		Size = UDim2.new(0, 780, 0, 520 + EXTRA_H),
+		Position = UDim2.new(0.5, -390, 0.5, -(260 + (EXTRA_H + EXTRA_ROW) / 2)),
+		Size = UDim2.new(0, 780, 0, 520 + EXTRA_H + EXTRA_ROW),
 		ZIndex = 2,
 	}, screenGui)
 
@@ -83507,8 +83639,22 @@ local function buildGui()
 		end
 	end)
 
-	-- Save row ----------------------------------------------------------------------------
+	-- Parry mode row ------------------------------------------------------------------------
 	y = 448 + EXTRA_H
+	ui.modeButton = newButton(right, PARRY_MODES.hitbox.text, UDim2.new(0, 0, 0, y), UDim2.new(0, 190, 0, 22), function()
+		if not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		draft.pmode = draft.pmode == "enter" and "hitbox" or "enter"
+		refreshModeRow()
+	end)
+	ui.modeButton.TextSize = 11
+	ui.modeHint = newLabel(right, PARRY_MODES.hitbox.hint, UDim2.new(0, 196, 0, y), UDim2.new(1, -196, 0, 22), 10)
+	ui.modeHint.TextWrapped = true
+
+	-- Save row ----------------------------------------------------------------------------
+	y = 476 + EXTRA_H
 	local saveButton = newButton(right, "Save To Script", UDim2.new(0, 0, 0, y), UDim2.new(0, 170, 0, 26), function()
 		if selected then
 			saveDraft(selected)
@@ -84444,6 +84590,10 @@ local function create(kind)
 		end
 
 		draft.name = timing.name
+		if previous and previous.name ~= timing.name then
+			SaveManager.removeExport(previous)
+		end
+		SaveManager.exportTiming(isSound and "sound" or "effect", timing)
 		if persist() then
 			notify(prefix .. "saved '%s' to your timing config.", timing.name)
 		else
@@ -84460,6 +84610,7 @@ local function create(kind)
 		end
 		container.timings[entry.key] = nil
 		entry.draft = nil
+		SaveManager.removeExport(existing)
 		if ensureConfig() then
 			persist()
 		end
@@ -85340,7 +85491,7 @@ local Workspace = game:GetService("Workspace")
 ---------------------------------------------------------------------------
 -- Constants / state
 ---------------------------------------------------------------------------
-local FOLDER = "Lycoris-Rewrite-DamageLog"
+local FOLDER = "Merit-DamageLog"
 local FILE = "culprits.json"
 local EVENT_KEEP = 4.0
 local MAX_EVENTS = 600
@@ -85379,7 +85530,7 @@ local lastRowRefresh = 0
 local filterKind = "All"
 local hideKnown = false
 
-local fs = Filesystem.new(FOLDER)
+local fs = Filesystem.new(FOLDER, "Lycoris-Rewrite-DamageLog")
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -88713,7 +88864,7 @@ Tooltip = "Use Unbidden instead of parry/dodge when available and off cooldown. 
 local antiBreakerToggle = autoDefenseDepBox:AddToggle("AntiBreakerEnabled", {
 Text = "Anti-AP Breaker",
 Default = false,
-Tooltip = "apc on top",
+Tooltip = "Merit on top",
 })
 antiBreakerToggle:AddKeyPicker(
 "AntiBreakerKeybind",
