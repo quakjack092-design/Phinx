@@ -19109,7 +19109,13 @@ local blocking = effectReplicatorModule:HasEffect("Blocking")
 inputData["f"] = true
 for id, data in next, blockQueue do
 local dead = data.dt and os.clock() - data.start >= data.dt
-local deflected = data.type == QueuedBlocking.BLOCK_TYPE_DEFLECT and blocking
+local freshBlocking = blocking
+if blocking and data.stale and os.clock() < data.staleUntil then
+if effectReplicatorModule:FindEffect("Blocking") == data.stale then
+freshBlocking = false
+end
+end
+local deflected = data.type == QueuedBlocking.BLOCK_TYPE_DEFLECT and freshBlocking
 if not deflected and not dead then
 continue
 end
@@ -19156,6 +19162,7 @@ end
 if effectReplicatorModule:HasEffect("CastingSpell") then
 return
 end
+local staleBlock = effectReplicatorModule:FindEffect("Blocking")
 blockRemote:FireServer()
 inputData["f"] = true
 sprintFunction(false)
@@ -19172,6 +19179,8 @@ blockQueue[id] = {
 start = os.clock(),
 type = type,
 dt = effectiveDt,
+stale = staleBlock,
+staleUntil = os.clock() + 0.4,
 }
 end
 function QueuedBlocking.empty()
@@ -66091,6 +66100,9 @@ end
 if typeof(values.ihbc) == "boolean" then
 self.ihbc = values.ihbc
 end
+if typeof(values.cond) == "string" then
+self.cond = values.cond
+end
 end
 function Action:equals(other)
 if self._type ~= other._type then
@@ -66108,6 +66120,9 @@ end
 if self.ihbc ~= other.ihbc then
 return false
 end
+if (self.cond or "always") ~= (other.cond or "always") then
+return false
+end
 return true
 end
 function Action:clone()
@@ -66117,6 +66132,7 @@ clone._when = self._when
 clone.name = self.name
 clone.hitbox = self.hitbox
 clone.ihbc = self.ihbc
+clone.cond = self.cond
 return clone
 end
 function Action:serialize()
@@ -66130,6 +66146,7 @@ Y = self.hitbox.Y,
 Z = self.hitbox.Z,
 },
 ihbc = self.ihbc,
+cond = self.cond or "always",
 }
 end
 function Action.new(values)
@@ -66139,6 +66156,7 @@ self._when = 0
 self.name = ""
 self.hitbox = Vector3.zero
 self.ihbc = false
+self.cond = "always"
 self.tp = 0
 if values then
 self:load(values)
@@ -66874,6 +66892,48 @@ end
 self:notify(timing, "Action type 'RPUE Parry' is being executed.")
 self:parry(timing, nil)
 end)
+-- Fallback-action conditions ("If no parry", "If missed parry + hit").
+-- Stored on Defender itself (not as module locals) to stay clear of Lua's local-variable limit.
+Defender._apDamage = { humanoid = nil, conn = nil, lastHealth = 0, damagedAt = -math.huge }
+function Defender:apEnsureDamageTracker()
+	local tracker = Defender._apDamage
+	local character = players.LocalPlayer and players.LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid == tracker.humanoid then
+		return
+	end
+	if tracker.conn then
+		pcall(function()
+			tracker.conn:Disconnect()
+		end)
+		tracker.conn = nil
+	end
+	tracker.humanoid = humanoid
+	if humanoid then
+		tracker.lastHealth = humanoid.Health
+		tracker.conn = humanoid.HealthChanged:Connect(function(health)
+			if health < tracker.lastHealth then
+				tracker.damagedAt = os.clock()
+			end
+			tracker.lastHealth = health
+		end)
+	end
+end
+function Defender:apCondMet(action)
+	local cond = action and action.cond
+	if not cond or cond == "always" then
+		return true
+	end
+	self:apEnsureDamageTracker()
+	local parriedAt = self._apParryAt
+	if cond == "noparry" then
+		return parriedAt == nil
+	end
+	if cond == "misshit" then
+		return parriedAt ~= nil and Defender._apDamage.damagedAt >= parriedAt
+	end
+	return true
+end
 Defender.valid = LPH_NO_VIRTUALIZE(function(self, options)
 local integer = Random.new():NextNumber(1.0, 100.0)
 local rate = Configuration.expectOptionValue("FailureRate") or 0.0
@@ -66893,6 +66953,12 @@ return internalNotifyFunction(timing, "(%i <= %i) Intentionally did not run.", i
 end
 if self._tradeWonTrack and self._tradeWonTrack == self.track then
 return internalNotifyFunction(timing, "Trade already won on this attack; skipping.")
+end
+if options.action and not self:apCondMet(options.action) then
+return internalNotifyFunction(
+timing,
+string.format("Action condition '%s' not met; skipping.", tostring(options.action.cond))
+)
 end
 if self.hits and next(self.hits) then
 return internalNotifyFunction(timing, "Already landed a hit on the attacker; skipping to not contest M1 priority.")
@@ -67169,6 +67235,7 @@ and not timing.duih
 and action:when() > 0
 and self.__type == "Animation"
 and actionType ~= "End Block"
+and (action.cond == nil or action.cond == "always")
 and autoFeintAgainstAllowed(timing)
 then
 self:afeint(timing, action, started, false)
@@ -67466,6 +67533,7 @@ return internalNotify(timing, "Feint Detected")
 end
 end
 self:SimulateInput(timing, { _type = "Parry" })
+self._apParryAt = os.clock()
 return QueuedBlocking.invoke(QueuedBlocking.BLOCK_TYPE_DEFLECT, "Defender_Deflect", nil)
 end
 internalNotify(timing, "Action type 'Parry' replaced to 'Dodge' type.")
@@ -67919,7 +67987,11 @@ if timing.umoa and self.__type == "Animation" then
 timing.et = action["_when"]
 end
 local actionType = action._type
-local isParryOrDodge = (actionType == "Parry" or actionType == "Dodge")
+local isConditional = action.cond ~= nil and action.cond ~= "always"
+if isConditional then
+self:apEnsureDamageTracker()
+end
+local isParryOrDodge = (actionType == "Parry" or actionType == "Dodge") and not isConditional
 local rdelay = self.offset or Latency.rdelay()
 if not LPH_OBFUSCATED and actionType == "Parry" and self.__type == "Animation" then
 local rtt = rdelay + Latency.sdelay()
@@ -67966,6 +68038,7 @@ and not timing.duih
 and action:when() > 0
 and self.__type == "Animation"
 and action._type ~= "End Block"
+and not isConditional
 and autoFeintAgainstAllowed(timing)
 then
 self:mark(Task.new(action._type, function()
@@ -67990,6 +68063,7 @@ Latency.rtt()
 end
 end)
 Defender.actions = LPH_NO_VIRTUALIZE(function(self, timing)
+self._apParryAt = nil
 for _, action in next, timing.actions:get() do
 self:action(timing, action)
 end
@@ -82515,6 +82589,7 @@ local function draftFromTiming(timing, entry)
 				type = action._type,
 				when = math.floor((tonumber(action._when) or 0) + 0.5),
 				hb = action.hitbox,
+				cond = action.cond or "always",
 			}
 		end
 	end
@@ -82587,6 +82662,11 @@ local function saveDraft(entry)
 		action._type = act.type
 		action._when = act.when
 		local base = string.format("%s %dms", act.type, act.when)
+		if act.cond == "noparry" then
+			base = base .. " (no parry)"
+		elseif act.cond == "misshit" then
+			base = base .. " (missed+hit)"
+		end
 		local name, n = base, 1
 		while used[name] do
 			n = n + 1
@@ -82595,6 +82675,7 @@ local function saveDraft(entry)
 		used[name] = true
 		action.name = name
 		action.hitbox = act.hb or draft.hitbox
+		action.cond = act.cond or "always"
 		timing.actions:push(action)
 	end
 
@@ -83252,6 +83333,18 @@ local function rebuildActionRows()
 		newButton(row, "Go", UDim2.new(0, 236, 0, 1), UDim2.new(0, 40, 0, 18), function()
 			seekMs(act.when)
 		end)
+		newButton(
+			row,
+			({ always = "Always", noparry = "If no parry", misshit = "If missed parry + hit" })[act.cond or "always"] or "Always",
+			UDim2.new(0, 312, 0, 1),
+			UDim2.new(0, 170, 0, 18),
+			function()
+				local order = { "always", "noparry", "misshit" }
+				local at = table.find(order, act.cond or "always") or 1
+				act.cond = order[(at % #order) + 1]
+				rebuildActionRows()
+			end
+		)
 		newButton(row, "X", UDim2.new(0, 280, 0, 1), UDim2.new(0, 28, 0, 18), function()
 			table.remove(draft.actions, idx)
 			rebuildActionRows()
@@ -84531,6 +84624,7 @@ local function create(kind)
 					type = action._type,
 					when = math.floor((tonumber(action._when) or 0) + 0.5),
 					hb = action.hitbox,
+					cond = action.cond or "always",
 				}
 			end
 		end
@@ -84603,6 +84697,11 @@ local function create(kind)
 			action._type = act.type
 			action._when = act.when
 			local base = string.format("%s %dms", act.type, act.when)
+			if act.cond == "noparry" then
+				base = base .. " (no parry)"
+			elseif act.cond == "misshit" then
+				base = base .. " (missed+hit)"
+			end
 			local name, n = base, 1
 			while used[name] do
 				n = n + 1
@@ -84611,6 +84710,7 @@ local function create(kind)
 			used[name] = true
 			action.name = name
 			action.hitbox = act.hb or draft.hitbox
+			action.cond = act.cond or "always"
 			timing.actions:push(action)
 		end
 
@@ -84888,6 +84988,18 @@ local function create(kind)
 			newButton(row, "Go", UDim2.new(0, 236, 0, 1), UDim2.new(0, 40, 0, 18), function()
 				seekMs(act.when)
 			end)
+			newButton(
+				row,
+				({ always = "Always", noparry = "If no parry", misshit = "If missed parry + hit" })[act.cond or "always"] or "Always",
+				UDim2.new(0, 312, 0, 1),
+				UDim2.new(0, 170, 0, 18),
+				function()
+					local order = { "always", "noparry", "misshit" }
+					local at = table.find(order, act.cond or "always") or 1
+					act.cond = order[(at % #order) + 1]
+					rebuildActionRows()
+				end
+			)
 			newButton(row, "X", UDim2.new(0, 280, 0, 1), UDim2.new(0, 28, 0, 18), function()
 				table.remove(draft.actions, idx)
 				rebuildActionRows()
