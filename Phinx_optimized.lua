@@ -82209,7 +82209,7 @@ local flipView = false
 
 -- Hitbox preview state ------------------------------------------------------
 local EXTRA_H = 80 -- extra window height (all of it goes to the 3D preview)
-local EXTRA_ROW = 28 -- extra window height for the parry mode row
+local EXTRA_ROW = 56 -- extra window height for the parry mode row + the hitbox offset row
 local DEFAULT_YAW = math.rad(35)
 local DEFAULT_PITCH = math.rad(28)
 local MIN_PITCH = math.rad(3)
@@ -82578,6 +82578,8 @@ local function draftFromTiming(timing, entry)
 		tag = timing.tag or "Undefined",
 		maxDist = tonumber(timing.imxd) or 60,
 		hitbox = timing.hitbox or Vector3.new(20, 20, 25),
+		hso = tonumber(timing.hso) or 0,
+		fhb = timing.fhb ~= false,
 		actions = {},
 	}
 	local ok, stack = pcall(function()
@@ -82604,6 +82606,8 @@ local function newDraft(entry)
 		tag = "Undefined",
 		maxDist = 60,
 		hitbox = Vector3.new(20, 20, 25),
+		hso = 0,
+		fhb = true,
 		actions = {},
 	}
 end
@@ -82655,6 +82659,8 @@ local function saveDraft(entry)
 	timing.imdd = 0
 	timing.imxd = draft.maxDist
 	timing.hitbox = draft.hitbox
+	timing.hso = draft.hso or 0
+	timing.fhb = draft.fhb ~= false
 
 	local used = {}
 	for _, act in ipairs(draft.actions) do
@@ -82900,12 +82906,25 @@ end
 -- Mirrors Defender.hitbox: a box centred on the attacker's root, pushed forward by half its length.
 local function hitboxCFrame(rootCFrame, size)
 	local info = getHitboxFrameInfo()
+	local face, side = info.face, info.side
+	if selected then
+		local draft = getDraft(selected)
+		if draft.fhb ~= nil then
+			face = draft.fhb
+		end
+		if draft.hso ~= nil then
+			side = draft.hso
+		end
+	end
+	if info.liveSide ~= nil then
+		side = info.liveSide
+	end
 	local cframe = rootCFrame
-	if info.face then
+	if face then
 		cframe = cframe * CFrame.new(0, 0, -(size.Z / 2))
 	end
-	if info.side ~= 0 then
-		cframe = cframe * CFrame.new(0, 0, info.side)
+	if side ~= 0 then
+		cframe = cframe * CFrame.new(0, 0, side)
 	end
 	return cframe
 end
@@ -83398,6 +83417,10 @@ local function refreshSettingsRow()
 	refreshModeRow()
 	ui.hitboxBox.Text = string.format("%g, %g, %g", draft.hitbox.X, draft.hitbox.Y, draft.hitbox.Z)
 	ui.distBox.Text = tostring(draft.maxDist)
+	if ui.offsetBox and ui.faceButton then
+		ui.offsetBox.Text = string.format("%g", draft.hso or 0)
+		ui.faceButton.Text = draft.fhb ~= false and "Centre: pushed forward" or "Centre: on attacker"
+	end
 	refreshHud()
 end
 
@@ -83405,6 +83428,7 @@ function AnimationLogger.select(entry)
 	selected = entry
 	holdStartMs = nil
 	liveHitbox = nil
+	getHitboxFrameInfo().liveSide = nil
 	if ui then
 		ui.holdButton.Text = "Hold Block"
 	end
@@ -83784,8 +83808,47 @@ local function buildGui()
 	ui.modeHint = newLabel(right, PARRY_MODES.hitbox.hint, UDim2.new(0, 196, 0, y), UDim2.new(1, -196, 0, 22), 10)
 	ui.modeHint.TextWrapped = true
 
-	-- Save row ----------------------------------------------------------------------------
+	-- Hitbox offset row ---------------------------------------------------------------------
 	y = 476 + EXTRA_H
+	newLabel(right, "hitbox offset", UDim2.new(0, 0, 0, y), UDim2.new(0, 84, 0, 22), 11)
+	ui.offsetBox = newTextBox(right, "0", UDim2.new(0, 88, 0, y), UDim2.new(0, 56, 0, 22), function(box)
+		getHitboxFrameInfo().liveSide = nil
+		if selected then
+			local draft = getDraft(selected)
+			draft.hso = tonumber(box.Text) or draft.hso or 0
+			box.Text = string.format("%g", draft.hso)
+			reframe()
+			updateHitboxVisual(true)
+			refreshHud()
+		end
+	end)
+	-- Live preview while typing.
+	ui.offsetBox:GetPropertyChangedSignal("Text"):Connect(function()
+		if not selected or not ui.offsetBox:IsFocused() then
+			return
+		end
+		local typed = tonumber(ui.offsetBox.Text)
+		if typed then
+			getHitboxFrameInfo().liveSide = typed
+			reframe()
+		end
+	end)
+	ui.faceButton = newButton(right, "Centre: pushed forward", UDim2.new(0, 150, 0, y), UDim2.new(0, 150, 0, 22), function()
+		if not selected then
+			return
+		end
+		local draft = getDraft(selected)
+		draft.fhb = not (draft.fhb ~= false)
+		ui.faceButton.Text = draft.fhb and "Centre: pushed forward" or "Centre: on attacker"
+		reframe()
+		updateHitboxVisual(true)
+	end)
+	ui.faceButton.TextSize = 11
+	ui.offsetHint = newLabel(right, "+ pulls the box back toward you, - pushes it further out front.", UDim2.new(0, 306, 0, y), UDim2.new(1, -306, 0, 22), 10)
+	ui.offsetHint.TextWrapped = true
+
+	-- Save row ----------------------------------------------------------------------------
+	y = 504 + EXTRA_H
 	local saveButton = newButton(right, "Save To Script", UDim2.new(0, 0, 0, y), UDim2.new(0, 170, 0, 26), function()
 		if selected then
 			saveDraft(selected)
