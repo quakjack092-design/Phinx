@@ -66891,6 +66891,9 @@ end
 if (Configuration.expectToggleValue("AllowFailure") or overrideData) and integer <= rate then
 return internalNotifyFunction(timing, "(%i <= %i) Intentionally did not run.", integer, rate)
 end
+if self._tradeWonTrack and self._tradeWonTrack == self.track then
+return internalNotifyFunction(timing, "Trade already won on this attack; skipping.")
+end
 if self.hits and next(self.hits) then
 return internalNotifyFunction(timing, "Already landed a hit on the attacker; skipping to not contest M1 priority.")
 end
@@ -67401,6 +67404,9 @@ simulateRightClick(holdTime())
 end
 end)
 Defender.parry = LPH_NO_VIRTUALIZE(function(self, timing, action)
+if self._tradeWonTrack and self._tradeWonTrack == self.track then
+return
+end
 local options = DodgeOptions.new()
 options.rollCancel = Configuration.expectToggleValue("RollCancel")
 options.rollCancelDelay = Configuration.expectOptionValue("RollCancelDelay") or 0.0
@@ -71089,6 +71095,7 @@ self.track = track
 self._approachMax = approachMax
 self.offset = Latency.rdelay() + (gateDelay or 0)
 self._feintedTrack = nil
+self._tradeWonTrack = nil
 self._galeFeintTracks = nil
 self._respectFeint = not reactRoll(timing)
 local ed = self._evaluationData[track]
@@ -71138,33 +71145,62 @@ local function localDamagedRecently(window)
 end
 -- You landed a hit on this entity while one of its attacks was still running and
 -- you have not been hit yourself: you won the trade, so drop the pending parry/dodge.
-function AnimatorDefender:_apTradeWon()
+-- The win is sticky for the whole track (_tradeWonTrack): rescheduled/forced tasks,
+-- prediction, punishment, unbidden and module parries are all blocked until a new track starts.
+function AnimatorDefender:_apTradeWon(reason)
 	if Configuration.expectToggleValue("CancelOnTradeWin") == false then
 		return
 	end
 	if not self.track or not self.timing then
 		return
 	end
+	if self._tradeWonTrack == self.track then
+		return
+	end
 	local localPlayer = players.LocalPlayer
 	if self._playerOwner == localPlayer or (localPlayer.Character and self.entity == localPlayer.Character) then
 		return
 	end
-	-- Hyper armor (and criticals) are not interrupted by being hit, so keep defending those.
-	if self.timing.ha then
-		return
+	local humanoid = self.entity:FindFirstChildOfClass("Humanoid")
+	local dead = humanoid ~= nil and humanoid.Health <= 0
+	-- A dead enemy cannot hit you, so it always counts (even hyper armor / while you were hit).
+	if not dead then
+		-- Hyper armor (and criticals) are not interrupted by being hit, so keep defending those.
+		if self.timing.ha then
+			return
+		end
+		local distance = self:distance(self.entity)
+		if not distance or distance > TRADE_MAX_DISTANCE then
+			return
+		end
+		if localDamagedRecently(TRADE_LOCAL_DAMAGE_WINDOW) then
+			return
+		end
 	end
-	local distance = self:distance(self.entity)
-	if not distance or distance > TRADE_MAX_DISTANCE then
-		return
-	end
-	if localDamagedRecently(TRADE_LOCAL_DAMAGE_WINDOW) then
-		return
-	end
-	Logger.warn("(%s) Trade won; cancelling running actions for '%s'.", self.entity.Name, self.timing.name or "?")
+	Logger.warn(
+		"(%s) Trade won (%s); cancelling running actions for '%s'.",
+		self.entity.Name,
+		reason or "hit",
+		self.timing.name or "?"
+	)
+	self._tradeWonTrack = self.track
 	self._feintedTrack = self.track
 	self:clean()
 	QueuedBlocking.stop("Defender_Deflect")
 	QueuedBlocking.stop("Defender_BlockFallback")
+end
+-- Health-based trade detection: catches hits that never spawn a recognised hit effect / stagger animation.
+function AnimatorDefender:_apDamageTrade(humanoid, damage)
+	if humanoid.Health > 0 then
+		if damage < 5 then  -- min damage for health-based trade detection
+			return
+		end
+		local attackedAt = StateListener.lAnimTimestamp
+		if not attackedAt or os.clock() - attackedAt > 1.0 then  -- must have swung within the last 1.0s
+			return
+		end
+	end
+	self:_apTradeWon("damage")
 end
 function AnimatorDefender:_cancelFeintedTrack(reason, expectedTrack)
 if
@@ -71276,6 +71312,7 @@ end)
 self._trackStoppedAt = nil
 self._trackPlayedAt = 0
 self._feintedTrack = nil
+self._tradeWonTrack = nil
 self._feintPlayingConn = nil
 self._galeFeintTracks = nil
 self._respectFeint = true
@@ -71288,6 +71325,7 @@ self.maid:mark(damageHumanoid.HealthChanged:Connect(function(health)
 if health < lastHealth then
 self._lastDamage = lastHealth - health
 self._lastDamageAt = os.clock()
+self:_apDamageTrade(damageHumanoid, self._lastDamage)
 end
 lastHealth = health
 end))
